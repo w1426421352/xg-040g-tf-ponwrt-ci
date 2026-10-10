@@ -1,0 +1,373 @@
+name: Build PonWrt for XG-040G-TF
+
+run-name: >-
+  XG-040G-TF · PonWrt ${{ inputs.ponwrt_ref }} ·
+  ${{ inputs.extra_packages != '' && 'custom packages' || 'default packages' }}
+  ${{ inputs.include_all_kmods && ' · all kmods' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ponwrt_ref:
+        description: "PonWrt branch, tag, or commit SHA"
+        required: true
+        default: "master"
+        type: string
+      extra_packages:
+        description: "Extra packages, space separated; prefix a name with - to remove it"
+        required: false
+        default: ""
+        type: string
+      include_all_kmods:
+        description: "Build every target-compatible kmod and upload a kmod bundle"
+        required: true
+        default: false
+        type: boolean
+      publish_release:
+        description: "Publish the firmware artifact as a GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xg-040g-tf-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PONWRT_REPO: https://github.com/pbs05/ponwrt.git
+  PONWRT_REF: ${{ inputs.ponwrt_ref }}
+  INCLUDE_ALL_KMODS: ${{ inputs.include_all_kmods }}
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build nokia_xg-040g-tf-ubi
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out build configuration
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libfuse-dev libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-netifaces python3-pip python3-ply \
+            python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: ponwrt-dl-${{ hashFiles('configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          restore-keys: |
+            ponwrt-dl-
+
+      - name: Clone PonWrt
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            rm -rf openwrt
+            if git init openwrt \
+              && git -C openwrt remote add origin "$PONWRT_REPO" \
+              && git -C openwrt fetch --depth=1 origin "$PONWRT_REF" \
+              && git -C openwrt checkout --detach FETCH_HEAD; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Unable to clone PonWrt after $attempt attempts"
+              exit 1
+            fi
+            echo "::warning::PonWrt clone failed (attempt $attempt/3); retrying"
+            sleep $((attempt * 10))
+          done
+          echo "OPENWRT_PATH=$GITHUB_WORKSPACE/openwrt" >> "$GITHUB_ENV"
+          echo "PONWRT_COMMIT=$(git -C openwrt rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Restore host and toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/staging_dir/host*
+            openwrt/staging_dir/toolchain-*
+          key: ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          restore-keys: |
+            ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-
+
+      - name: Install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure XG-040G-TF
+        env:
+          EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+        run: |
+          set -euo pipefail
+          cp "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" "$OPENWRT_PATH/.config"
+
+          # Keep package names data-only: no shell fragments are accepted here.
+          set -f
+          requested_packages=""
+          for package in $EXTRA_PACKAGES; do
+            if [[ "$package" =~ ^-([A-Za-z0-9_.-]+)$ ]]; then
+              name="${package#-}"
+              printf '# CONFIG_PACKAGE_%s is not set\n' "$name" >> "$OPENWRT_PATH/.config"
+            elif [[ "$package" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              printf 'CONFIG_PACKAGE_%s=y\n' "$package" >> "$OPENWRT_PATH/.config"
+              requested_packages="$requested_packages $package"
+            else
+              echo "::error::Invalid package name: $package"
+              exit 1
+            fi
+          done
+          set +f
+
+          if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
+            printf 'CONFIG_ALL_KMODS=y\n' >> "$OPENWRT_PATH/.config"
+          fi
+
+          make -C "$OPENWRT_PATH" defconfig
+
+          grep -q '^CONFIG_TARGET_airoha_an7581_DEVICE_nokia_xg-040g-tf-ubi=y$' \
+            "$OPENWRT_PATH/.config" \
+            || { echo "::error::TF device profile was not selected"; exit 1; }
+
+          if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
+            grep -q '^CONFIG_ALL_KMODS=y$' "$OPENWRT_PATH/.config" \
+              || { echo "::error::CONFIG_ALL_KMODS was dropped by defconfig"; exit 1; }
+          fi
+
+          required_packages="
+            kmod-airoha-pon-frontend
+            kmod-airoha-en7572
+            kmod-airoha-paged-bosa
+            kmod-airoha-xpon
+            airoha-ponctl
+            airoha-pond
+            luci-app-pon
+          "
+          for package in $required_packages; do
+            grep -q "^CONFIG_PACKAGE_${package}=y$" "$OPENWRT_PATH/.config" \
+              || { echo "::error::Required PON package was dropped: $package"; exit 1; }
+          done
+
+          for package in $requested_packages; do
+            grep -q "^CONFIG_PACKAGE_${package}=[ym]$" "$OPENWRT_PATH/.config" \
+              || {
+                echo "::error::Requested package was not selected after defconfig: $package"
+                echo "::error::Check the package name and whether its feed supports this PonWrt revision."
+                exit 1
+              }
+          done
+
+          {
+            echo "### Build configuration"
+            echo "- Device: \`nokia_xg-040g-tf-ubi\`"
+            echo "- PonWrt commit: \`$PONWRT_COMMIT\`"
+            echo "- Required PON packages: verified"
+            echo "- Package manager: \`apk\`"
+            echo "- All target-compatible kmods: \`$INCLUDE_ALL_KMODS\`"
+            if [ -n "$requested_packages" ]; then
+              echo "- Extra packages: verified after \`make defconfig\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download sources
+        working-directory: openwrt
+        run: |
+          make download -j"$(nproc)"
+          find dl -size -1024c -type f -delete
+
+      - name: Build firmware
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          if ! make -j"$(nproc)" world 2>&1 | tee "$GITHUB_WORKSPACE/build.log"; then
+            echo "::warning::Parallel build failed; retrying with a verbose single-threaded build"
+            make -j1 V=s world 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          fi
+
+      - name: Prepare artifacts
+        run: |
+          set -euo pipefail
+          out="$OPENWRT_PATH/bin/targets/airoha/an7581"
+          test -d "$out"
+
+          {
+            echo "device=nokia_xg-040g-tf-ubi"
+            echo "ponwrt_repo=$PONWRT_REPO"
+            echo "ponwrt_ref=$PONWRT_REF"
+            echo "ponwrt_commit=$PONWRT_COMMIT"
+            echo "build_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "PON data is device-unique and is intentionally not embedded."
+            echo "Restore the original bosa and ri backups after flashing."
+            echo
+            echo "Feed commits:"
+            for feed in packages luci routing telephony video pon_drivers pon_userspace; do
+              feed_path="$OPENWRT_PATH/feeds/$feed"
+              if [ -d "$feed_path/.git" ]; then
+                printf '%s=%s\n' "$feed" "$(git -C "$feed_path" rev-parse HEAD)"
+              fi
+            done
+          } > "$out/build-manifest.txt"
+
+          cp "$OPENWRT_PATH/.config" "$out/build.config"
+          cp "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" "$out/base.config"
+
+          if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
+            bundle="$OPENWRT_PATH/kmod-bundle"
+            package_root="$bundle/packages"
+            rm -rf "$bundle"
+            mkdir -p "$package_root"
+
+            # Preserve the bin/ tree layout so duplicate package names from
+            # different feeds cannot overwrite one another.
+            while IFS= read -r -d '' package_file; do
+              relative="${package_file#$OPENWRT_PATH/bin/}"
+              destination="$package_root/$relative"
+              mkdir -p "$(dirname "$destination")"
+              cp "$package_file" "$destination"
+            done < <(
+              find "$OPENWRT_PATH/bin" -type f \
+                \( -name 'kmod-*.apk' -o -name 'kernel*.apk' \
+                   -o -name 'kmod-*.ipk' -o -name 'kernel*.ipk' \
+                   -o -name '*-firmware*.apk' -o -name '*-firmware*.ipk' \) \
+                -print0
+            )
+
+            kmod_count=$(find "$package_root" -type f \
+              \( -name 'kmod-*.apk' -o -name 'kmod-*.ipk' \) | wc -l)
+            [ "$kmod_count" -gt 0 ] \
+              || { echo "::error::CONFIG_ALL_KMODS produced no kmod packages"; exit 1; }
+
+            cp "$OPENWRT_PATH/.config" "$bundle/build.config"
+            {
+              echo "device=nokia_xg-040g-tf-ubi"
+              echo "ponwrt_commit=$PONWRT_COMMIT"
+              echo "kmod_count=$kmod_count"
+              echo "package_manager=apk"
+              echo
+              echo "Install only on the matching XG-040G-TF PonWrt release."
+              echo "The bundle is not a generic OpenWrt kmod repository."
+              echo "If using apk, install local packages from the packages/ tree."
+            } > "$bundle/kmod-manifest.txt"
+
+            (
+              cd "$bundle"
+              find . -type f ! -name SHA256SUMS -print0 \
+                | sort -z \
+                | xargs -0 sha256sum
+            ) > "$bundle/SHA256SUMS"
+
+            python3 - "$bundle" "$out/xg-040g-tf-kmods.zip" <<'PY'
+          import os
+          import sys
+          import zipfile
+
+          root, output = sys.argv[1:3]
+          with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+              for directory, _, files in os.walk(root):
+                  for name in sorted(files):
+                      path = os.path.join(directory, name)
+                      archive.write(path, os.path.relpath(path, root))
+          PY
+
+            cp "$bundle/SHA256SUMS" "$out/xg-040g-kmods.SHA256SUMS"
+            rm -rf "$bundle"
+
+            {
+              echo "- \`xg-040g-kmods.zip\` — target-compatible kmod/kernel/firmware packages"
+              echo "- kmod count: \`$kmod_count\`"
+              echo "- Only install packages matching this exact firmware release"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "### Firmware artifacts"
+            echo "PonWrt commit: \`$PONWRT_COMMIT\`"
+            echo "The artifact contains the TF UBI image, recovery image (if generated), config, manifest, and SHA256SUMS."
+            echo
+            echo "**Important:** \`bosa\` and \`ri\` are per-device data and are not included in this build."
+            if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
+              echo "**kmod bundle:** \`xg-040g-kmods.zip\` contains only packages built for this exact kernel/configuration."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          (
+            cd "$out"
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | sort -z \
+              | xargs -0 sha256sum
+          ) > "$out/SHA256SUMS"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xg-040g-tf-ponwrt-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/airoha/an7581
+            build.log
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish_release }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xg-040g-tf-ponwrt-${{ github.run_number }}
+          path: release-assets
+
+      - name: Publish release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: xg-040g-tf-ponwrt-${{ github.run_number }}
+          name: XG-040G-TF PonWrt ${{ github.run_number }}
+          commit: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: release-assets/openwrt/bin/targets/airoha/an7581/*
+          artifactErrorsFailBuild: true
+          allowUpdates: false
+          replacesArtifacts: true
+          body: |
+            PonWrt firmware for Nokia XG-040G-TF.
+
+            - PonWrt ref: `${{ inputs.ponwrt_ref }}`
+            - Build commit: `${{ github.sha }}`
+            - Target: `nokia_xg-040g-tf-ubi`
+            - All target-compatible kmods: `${{ inputs.include_all_kmods }}`
+
+            Only use kmods from the matching firmware build. Restore the
+            device's own PON identity data after flashing.

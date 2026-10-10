@@ -1,0 +1,14 @@
+# OpenWrt build output
+openwrt/
+bin/
+staging_dir/
+build_dir/
+dl/
+
+# Local/private device data: never commit PON calibration or identity dumps.
+*.bin
+*.img
+*.dump
+*.backup
+private/
+
