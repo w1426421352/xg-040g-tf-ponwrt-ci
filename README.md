@@ -12,24 +12,28 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
 
 ## GitHub 云编译
 
-1. 把本仓库推到自己的 GitHub 仓库，进入 `Settings -> Actions -> General`，允许 Actions 运行。
-2. 打开 `Actions -> Build PonWrt for XG-040G-TF -> Run workflow`。
-3. `ponwrt_ref` 默认填 `master`；需要可复现构建时填一个提交 SHA。
-4. 需要附加软件包时，在 `extra_packages` 填空格分隔的包名，例如：
+1. 进入 `configs/xg-040g-tf.build.env` 修改源码分支、附加包、是否打包全量 kmod
+   和是否发布 Release：
 
    ```text
-   luci-app-sqm kmod-tun
+   PONWRT_REF="master"
+   EXTRA_PACKAGES="luci-app-sqm kmod-tun"
+   INCLUDE_ALL_KMODS="true"
+   PUBLISH_RELEASE="true"
    ```
 
-   删除基础包时在包名前加 `-`，例如 `-luci-app-upnp`。
-5. 编译完成后，在运行页面底部下载 `xg-040g-tf-ponwrt-*` Artifact。先核对
+   删除基础包时在包名前加 `-`，例如 `EXTRA_PACKAGES="-luci-app-upnp"`。
+2. 推送配置文件到 `main` 会立即触发一次构建。工作流每天北京时间 02:00 检查
+   `PONWRT_REF` 对应的上游提交，只有发现新提交才编译；成功构建后会记录提交状态。
+3. 手动运行时只需要选择 `force_build`，不需要在网页表单里重复填写构建参数。
+4. 编译完成后，在运行页面底部下载 `xg-040g-tf-ponwrt-*` Artifact。先核对
    `SHA256SUMS`，再使用其中的固件文件。
-6. 需要把产物发布到仓库 Release 时，将 `publish_release` 设为 `true`；默认只上传
-   Actions Artifact，避免测试构建自动创建 Release。
+5. `PUBLISH_RELEASE="true"` 时，工作流会按 PonWrt 提交短 SHA 创建或更新 GitHub
+   Release；设为 `false` 时只保留 Actions Artifact。
 
-工作流默认只上传 Artifact，不自动创建 Release，也不会自动刷写设备。
+工作流不会自动刷写设备，也不会把 PON 身份数据写入产物。
 
-将 `include_all_kmods` 设为 `true` 时，CI 会启用 `CONFIG_ALL_KMODS=y`，额外生成
+将 `INCLUDE_ALL_KMODS="true"` 时，CI 会启用 `CONFIG_ALL_KMODS=y`，额外生成
 `xg-040g-kmods.zip`。压缩包里包含本次构建生成的全部目标兼容 `kmod-*` 包，以及匹配的
 kernel/firmware 伴随包、`.config`、清单和校验文件。
 
@@ -44,7 +48,7 @@ kernel/firmware 伴随包、`.config`、清单和校验文件。
 PonWrt 的 `feeds.conf.default` 仍然使用 ImmortalWrt 的 `packages`、`luci` 和 OpenWrt 的
 `routing`、`telephony`、`video` feeds，同时额外加入 `pon_drivers`、`pon_userspace` 两个
 PON feed。工作流每次构建都会执行 `feeds update -a`、`feeds install -a`，所以普通 LuCI
-插件和用户态程序可以通过 `extra_packages` 加入固件。
+插件和用户态程序可以通过 `EXTRA_PACKAGES` 加入固件。
 
 需要区分三类包：
 
@@ -55,11 +59,11 @@ PON feed。工作流每次构建都会执行 `feeds update -a`、`feeds install 
   `/etc/opkg`，需要先适配后再用。
 
 PonWrt 的 AN7581 默认配置还会关闭 `luci-app-iptv`，因此本仓库也不强制内置它；确实需要
-时再把 `luci-app-iptv` 放进 `extra_packages`，让 CI 验证它在当前 feed 组合下能否编译。
+时再把 `luci-app-iptv` 放进 `EXTRA_PACKAGES`，让 CI 验证它在当前 feed 组合下能否编译。
 
-工作流会在 `make defconfig` 后验证你输入的附加包仍然存在，并把所有 feed 的 commit 写入
-`build-manifest.txt`。这能避免上游插件改名、依赖不满足或被 Kconfig 静默移除后仍产出错误
-固件。
+工作流会在 `make defconfig` 后验证附加包仍然存在，把所有 feed 的 commit 和 PonWrt
+提交写入 `build-manifest.txt`，并在成功后更新 `ci/last-built-ponwrt-commit.txt`。
+这能避免上游插件改名、依赖不满足或被 Kconfig 静默移除后仍产出错误固件。
 
 ## PON 数据必须先备份
 

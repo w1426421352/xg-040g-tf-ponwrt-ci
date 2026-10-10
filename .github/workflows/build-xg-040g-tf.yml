@@ -1,30 +1,22 @@
 name: Build PonWrt for XG-040G-TF
 
-run-name: >-
-  XG-040G-TF · PonWrt ${{ inputs.ponwrt_ref }} ·
-  ${{ inputs.extra_packages != '' && 'custom packages' || 'default packages' }}
-  ${{ inputs.include_all_kmods && ' · all kmods' || '' }}
+run-name: XG-040G-TF PonWrt · ${{ github.event_name }}
 
 on:
+  schedule:
+    # 02:00 Asia/Shanghai (18:00 UTC), once per day.
+    - cron: "0 18 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-xg-040g-tf.yml"
+      - "configs/xg-040g-tf.build.env"
+      - "configs/xg-040g-tf.config"
   workflow_dispatch:
     inputs:
-      ponwrt_ref:
-        description: "PonWrt branch, tag, or commit SHA"
-        required: true
-        default: "master"
-        type: string
-      extra_packages:
-        description: "Extra packages, space separated; prefix a name with - to remove it"
-        required: false
-        default: ""
-        type: string
-      include_all_kmods:
-        description: "Build every target-compatible kmod and upload a kmod bundle"
-        required: true
-        default: false
-        type: boolean
-      publish_release:
-        description: "Publish the firmware artifact as a GitHub Release"
+      force_build:
+        description: "Build even when the configured PonWrt commit has not changed"
         required: true
         default: false
         type: boolean
@@ -37,22 +29,154 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PONWRT_REPO: https://github.com/pbs05/ponwrt.git
-  PONWRT_REF: ${{ inputs.ponwrt_ref }}
-  INCLUDE_ALL_KMODS: ${{ inputs.include_all_kmods }}
   TZ: Asia/Shanghai
 
 jobs:
-  build:
-    name: Build nokia_xg-040g-tf-ubi
+  check-upstream:
+    name: Check PonWrt upstream
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    outputs:
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      ponwrt_repo: ${{ steps.resolve.outputs.ponwrt_repo }}
+      ponwrt_ref: ${{ steps.resolve.outputs.ponwrt_ref }}
+      extra_packages: ${{ steps.resolve.outputs.extra_packages }}
+      include_all_kmods: ${{ steps.resolve.outputs.include_all_kmods }}
+      publish_release: ${{ steps.resolve.outputs.publish_release }}
+      release_prefix: ${{ steps.resolve.outputs.release_prefix }}
+      source_commit: ${{ steps.resolve.outputs.source_commit }}
+      source_commit_short: ${{ steps.resolve.outputs.source_commit_short }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      FORCE_BUILD: ${{ inputs.force_build || false }}
 
     steps:
       - name: Check out build configuration
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Resolve configured source and change status
+        id: resolve
+        run: |
+          set -euo pipefail
+          config="$GITHUB_WORKSPACE/configs/xg-040g-tf.build.env"
+          # shellcheck disable=SC1090
+          source "$config"
+
+          : "${PONWRT_REPO:?PONWRT_REPO is required}"
+          : "${PONWRT_REF:?PONWRT_REF is required}"
+          : "${INCLUDE_ALL_KMODS:?INCLUDE_ALL_KMODS is required}"
+          : "${PUBLISH_RELEASE:?PUBLISH_RELEASE is required}"
+          : "${RELEASE_PREFIX:?RELEASE_PREFIX is required}"
+
+          resolve_ref() {
+            if [[ "$PONWRT_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              printf '%s\n' "${PONWRT_REF,,}"
+              return
+            fi
+
+            refs="$(git ls-remote "$PONWRT_REPO" \
+              "refs/heads/$PONWRT_REF" \
+              "refs/tags/$PONWRT_REF" \
+              "refs/tags/$PONWRT_REF^{}")"
+            [ -n "$refs" ] || return 1
+            printf '%s\n' "$refs" | awk '
+              $2 ~ /\^\{\}$/ { print $1; found = 1; exit }
+              { candidate = $1 }
+              END {
+                if (!found && candidate != "") print candidate
+              }
+            '
+          }
+
+          source_commit=""
+          for attempt in 1 2 3; do
+            if source_commit="$(resolve_ref)"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Unable to resolve $PONWRT_REPO at $PONWRT_REF"
+              exit 1
+            fi
+            echo "::warning::Upstream check failed (attempt $attempt/3); retrying"
+            sleep $((attempt * 10))
+          done
+          [ -n "$source_commit" ] || {
+            echo "::error::Resolved upstream commit is empty"
+            exit 1
+          }
+
+          last_commit=""
+          state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt"
+          if [ -s "$state_file" ]; then
+            last_commit="$(tr -d '[:space:]' < "$state_file")"
+          fi
+
+          should_build=false
+          case "$EVENT_NAME" in
+            push)
+              should_build=true
+              ;;
+            workflow_dispatch)
+              if [ "$FORCE_BUILD" = "true" ] || [ -z "$last_commit" ] || [ "$source_commit" != "$last_commit" ]; then
+                should_build=true
+              fi
+              ;;
+            schedule)
+              if [ -z "$last_commit" ] || [ "$source_commit" != "$last_commit" ]; then
+                should_build=true
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported event: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "should_build=$should_build"
+            echo "ponwrt_repo=$PONWRT_REPO"
+            echo "ponwrt_ref=$PONWRT_REF"
+            echo "extra_packages=$EXTRA_PACKAGES"
+            echo "include_all_kmods=$INCLUDE_ALL_KMODS"
+            echo "publish_release=$PUBLISH_RELEASE"
+            echo "release_prefix=$RELEASE_PREFIX"
+            echo "source_commit=$source_commit"
+            echo "source_commit_short=${source_commit:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Upstream check"
+            echo "- Source: \`$PONWRT_REPO\`"
+            echo "- Ref: \`$PONWRT_REF\`"
+            echo "- Resolved commit: \`$source_commit\`"
+            echo "- Previously built: \`${last_commit:-none}\`"
+            echo "- Build required: \`$should_build\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build nokia_xg-040g-tf-ubi
+    if: ${{ needs.check-upstream.outputs.should_build == 'true' }}
+    needs: check-upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      PONWRT_REPO: ${{ needs.check-upstream.outputs.ponwrt_repo }}
+      PONWRT_REF: ${{ needs.check-upstream.outputs.ponwrt_ref }}
+      INCLUDE_ALL_KMODS: ${{ needs.check-upstream.outputs.include_all_kmods }}
+
+    steps:
+      - name: Check out build configuration
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Maximize build space and add swap
+        uses: easimon/maximize-build-space@master
+        with:
+          swap-size-mb: 8192
+          temp-reserve-mb: 100
+          root-reserve-mb: 1024
 
       - name: Free build space
         run: |
@@ -123,7 +247,7 @@ jobs:
 
       - name: Configure XG-040G-TF
         env:
-          EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+          EXTRA_PACKAGES: ${{ needs.check-upstream.outputs.extra_packages }}
         run: |
           set -euo pipefail
           cp "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" "$OPENWRT_PATH/.config"
@@ -336,8 +460,14 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: ${{ inputs.publish_release }}
-    needs: build
+    if: >-
+      ${{
+        needs.check-upstream.outputs.should_build == 'true' &&
+        needs.check-upstream.outputs.publish_release == 'true'
+      }}
+    needs:
+      - check-upstream
+      - build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -353,8 +483,8 @@ jobs:
       - name: Publish release
         uses: ncipollo/release-action@v1
         with:
-          tag: xg-040g-tf-ponwrt-${{ github.run_number }}
-          name: XG-040G-TF PonWrt ${{ github.run_number }}
+          tag: ${{ needs.check-upstream.outputs.release_prefix }}-${{ needs.check-upstream.outputs.source_commit_short }}
+          name: XG-040G-TF PonWrt ${{ needs.check-upstream.outputs.source_commit_short }}
           commit: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: release-assets/openwrt/bin/targets/airoha/an7581/*
@@ -364,10 +494,51 @@ jobs:
           body: |
             PonWrt firmware for Nokia XG-040G-TF.
 
-            - PonWrt ref: `${{ inputs.ponwrt_ref }}`
+            - PonWrt ref: `${{ needs.check-upstream.outputs.ponwrt_ref }}`
+            - PonWrt commit: `${{ needs.check-upstream.outputs.source_commit }}`
             - Build commit: `${{ github.sha }}`
             - Target: `nokia_xg-040g-tf-ubi`
-            - All target-compatible kmods: `${{ inputs.include_all_kmods }}`
+            - All target-compatible kmods: `${{ needs.check-upstream.outputs.include_all_kmods }}`
 
             Only use kmods from the matching firmware build. Restore the
             device's own PON identity data after flashing.
+
+  record-success:
+    name: Record successful upstream commit
+    if: >-
+      ${{
+        always() &&
+        needs.check-upstream.outputs.should_build == 'true' &&
+        needs.build.result == 'success' &&
+        (needs.release.result == 'success' || needs.release.result == 'skipped')
+      }}
+    needs:
+      - check-upstream
+      - build
+      - release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Save source commit state
+        env:
+          SOURCE_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p ci
+          printf '%s\n' "$SOURCE_COMMIT" > ci/last-built-ponwrt-commit.txt
+          git add ci/last-built-ponwrt-commit.txt
+          if git diff --cached --quiet; then
+            echo "Upstream commit state is already recorded"
+            exit 0
+          fi
+          git commit -m "ci: record successful PonWrt build $SOURCE_COMMIT"
+          git push origin HEAD:main
