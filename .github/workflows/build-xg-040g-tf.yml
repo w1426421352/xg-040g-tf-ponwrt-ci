@@ -41,11 +41,15 @@ jobs:
       ponwrt_ref: ${{ steps.resolve.outputs.ponwrt_ref }}
       extra_packages: ${{ steps.resolve.outputs.extra_packages }}
       include_all_kmods: ${{ steps.resolve.outputs.include_all_kmods }}
+      include_all_packages: ${{ steps.resolve.outputs.include_all_packages }}
+      use_ccache: ${{ steps.resolve.outputs.use_ccache }}
       publish_release: ${{ steps.resolve.outputs.publish_release }}
       release_prefix: ${{ steps.resolve.outputs.release_prefix }}
       source_commit: ${{ steps.resolve.outputs.source_commit }}
       source_commit_short: ${{ steps.resolve.outputs.source_commit_short }}
       config_hash: ${{ steps.resolve.outputs.config_hash }}
+      feed_hash: ${{ steps.resolve.outputs.feed_hash }}
+      feed_revisions: ${{ steps.resolve.outputs.feed_revisions }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
     env:
       EVENT_NAME: ${{ github.event_name }}
@@ -68,14 +72,20 @@ jobs:
           : "${PONWRT_REPO:?PONWRT_REPO is required}"
           : "${PONWRT_REF:?PONWRT_REF is required}"
           : "${INCLUDE_ALL_KMODS:?INCLUDE_ALL_KMODS is required}"
+          : "${INCLUDE_ALL_PACKAGES:?INCLUDE_ALL_PACKAGES is required}"
+          : "${USE_CCACHE:?USE_CCACHE is required}"
           : "${PUBLISH_RELEASE:?PUBLISH_RELEASE is required}"
           : "${RELEASE_PREFIX:?RELEASE_PREFIX is required}"
+          [ "${#PONWRT_FEEDS[@]}" -gt 0 ] || {
+            echo "::error::PONWRT_FEEDS must contain at least one feed"
+            exit 1
+          }
 
           config_hash="$(
-            {
-              sha256sum "$config" | awk '{print $1}'
-              sha256sum "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" | awk '{print $1}'
-            } | sha256sum | cut -c1-12
+            printf '%s\n' \
+              "$(sha256sum "$config" | awk '{print $1}')" \
+              "$(sha256sum "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" | awk '{print $1}')" \
+              | sha256sum | cut -c1-12
           )"
 
           resolve_ref() {
@@ -115,10 +125,51 @@ jobs:
             exit 1
           }
 
-          last_commit=""
-          state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt"
+          feed_revisions=""
+          for feed_spec in "${PONWRT_FEEDS[@]}"; do
+            feed_name="${feed_spec%%=*}"
+            feed_repo="${feed_spec#*=}"
+            [ -n "$feed_name" ] && [ -n "$feed_repo" ] || {
+              echo "::error::Invalid PONWRT_FEEDS entry: $feed_spec"
+              exit 1
+            }
+
+            feed_commit=""
+            for attempt in 1 2 3; do
+              if feed_commit="$(git ls-remote "$feed_repo" HEAD | awk 'NR == 1 { print $1 }')"; then
+                [ -n "$feed_commit" ] && break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::Unable to resolve feed $feed_name at $feed_repo"
+                exit 1
+              fi
+              echo "::warning::Feed check failed for $feed_name (attempt $attempt/3); retrying"
+              sleep $((attempt * 10))
+            done
+            feed_revisions+="${feed_name}=${feed_commit}"$'\n'
+          done
+          feed_hash="$(printf '%s' "$feed_revisions" | sha256sum | cut -c1-12)"
+
+          last_source_commit=""
+          last_feed_hash=""
+          last_config_hash=""
+          state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-state.env"
           if [ -s "$state_file" ]; then
-            last_commit="$(tr -d '[:space:]' < "$state_file")"
+            while IFS='=' read -r state_key state_value; do
+              case "$state_key" in
+                source_commit) last_source_commit="$state_value" ;;
+                feed_hash) last_feed_hash="$state_value" ;;
+                config_hash) last_config_hash="$state_value" ;;
+              esac
+            done < "$state_file"
+          elif [ -s "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt" ]; then
+            last_source_commit="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt")"
+          fi
+          state_changed=false
+          if [ "$source_commit" != "$last_source_commit" ] ||
+             [ "$feed_hash" != "$last_feed_hash" ] ||
+             [ "$config_hash" != "$last_config_hash" ]; then
+            state_changed=true
           fi
 
           should_build=false
@@ -127,12 +178,12 @@ jobs:
               should_build=true
               ;;
             workflow_dispatch)
-              if [ "$FORCE_BUILD" = "true" ] || [ -z "$last_commit" ] || [ "$source_commit" != "$last_commit" ]; then
+              if [ "$FORCE_BUILD" = "true" ] || [ "$state_changed" = "true" ]; then
                 should_build=true
               fi
               ;;
             schedule)
-              if [ -z "$last_commit" ] || [ "$source_commit" != "$last_commit" ]; then
+              if [ "$state_changed" = "true" ]; then
                 should_build=true
               fi
               ;;
@@ -153,7 +204,14 @@ jobs:
             echo "source_commit=$source_commit"
             echo "source_commit_short=${source_commit:0:12}"
             echo "config_hash=$config_hash"
-            echo "release_tag=${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}"
+            echo "feed_hash=$feed_hash"
+            echo "include_all_packages=$INCLUDE_ALL_PACKAGES"
+            echo "use_ccache=$USE_CCACHE"
+            echo "release_tag=${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}-${feed_hash}"
+            echo "feed_revisions<<EOF"
+            printf '%s' "$feed_revisions"
+            echo
+            echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -161,10 +219,15 @@ jobs:
             echo "- Source: \`$PONWRT_REPO\`"
             echo "- Ref: \`$PONWRT_REF\`"
             echo "- Resolved commit: \`$source_commit\`"
-            echo "- Previously built: \`${last_commit:-none}\`"
+            echo "- Previously built source: \`${last_source_commit:-none}\`"
+            echo "- Previously built feed hash: \`${last_feed_hash:-none}\`"
+            echo "- Previous configuration fingerprint: \`${last_config_hash:-none}\`"
             echo "- Build required: \`$should_build\`"
             echo "- Configuration fingerprint: \`$config_hash\`"
-            echo "- Immutable release tag: \`${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}\`"
+            echo "- Feed fingerprint: \`$feed_hash\`"
+            echo "- Feed revisions:"
+            printf '%s' "$feed_revisions" | sed 's/^/-   \`/; s/$/\`/'
+            echo "- Immutable release tag: \`${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}-${feed_hash}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
@@ -178,7 +241,12 @@ jobs:
       PONWRT_REF: ${{ needs.check-upstream.outputs.ponwrt_ref }}
       PONWRT_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
       INCLUDE_ALL_KMODS: ${{ needs.check-upstream.outputs.include_all_kmods }}
+      INCLUDE_ALL_PACKAGES: ${{ needs.check-upstream.outputs.include_all_packages }}
+      USE_CCACHE: ${{ needs.check-upstream.outputs.use_ccache }}
       CONFIG_HASH: ${{ needs.check-upstream.outputs.config_hash }}
+      FEED_HASH: ${{ needs.check-upstream.outputs.feed_hash }}
+      FEED_REVISIONS: ${{ needs.check-upstream.outputs.feed_revisions }}
+      CCACHE_DIR: ${{ github.workspace }}/openwrt/.ccache
 
     steps:
       - name: Check out build configuration
@@ -215,14 +283,6 @@ jobs:
             qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
             uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
 
-      - name: Restore download cache
-        uses: actions/cache@v4
-        with:
-          path: openwrt/dl
-          key: ponwrt-dl-${{ hashFiles('configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
-          restore-keys: |
-            ponwrt-dl-
-
       - name: Clone PonWrt
         run: |
           set -euo pipefail
@@ -245,21 +305,98 @@ jobs:
           echo "OPENWRT_PATH=$GITHUB_WORKSPACE/openwrt" >> "$GITHUB_ENV"
           echo "PONWRT_COMMIT=$(git -C openwrt rev-parse HEAD)" >> "$GITHUB_ENV"
 
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: ponwrt-dl-${{ hashFiles('configs/xg-040g-tf.build.env', 'configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          restore-keys: |
+            ponwrt-dl-
+
+      - name: Restore compiler cache
+        if: env.USE_CCACHE == 'true'
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ponwrt-ccache-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/xg-040g-tf.build.env', 'configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          restore-keys: |
+            ponwrt-ccache-${{ env.PONWRT_COMMIT }}-
+            ponwrt-ccache-
+
       - name: Restore host and toolchain cache
         uses: actions/cache@v4
         with:
           path: |
             openwrt/staging_dir/host*
             openwrt/staging_dir/toolchain-*
-          key: ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          key: ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/xg-040g-tf.build.env', 'configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
           restore-keys: |
             ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-
 
       - name: Install feeds
         working-directory: openwrt
         run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if ./scripts/feeds update -a; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Feed update failed after $attempt attempts"
+              exit 1
+            fi
+            echo "::warning::Feed update failed (attempt $attempt/3); retrying"
+            sleep $((attempt * 10))
+          done
+
+          while IFS='=' read -r feed_name feed_commit; do
+            [ -n "$feed_name" ] || continue
+            feed_path="feeds/$feed_name"
+            [ -d "$feed_path/.git" ] || {
+              echo "::error::Expected git feed is missing: $feed_name"
+              exit 1
+            }
+            for attempt in 1 2 3; do
+              if git -C "$feed_path" fetch --depth=1 origin "$feed_commit" \
+                && git -C "$feed_path" checkout --detach "$feed_commit"; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::Unable to pin feed $feed_name to $feed_commit"
+                exit 1
+              fi
+              echo "::warning::Feed pin failed for $feed_name (attempt $attempt/3); retrying"
+              sleep $((attempt * 10))
+            done
+            test "$(git -C "$feed_path" rev-parse HEAD)" = "$feed_commit" \
+              || { echo "::error::Feed pin verification failed: $feed_name"; exit 1; }
+          done <<< "$FEED_REVISIONS"
+
+          for attempt in 1 2 3; do
+            if ./scripts/feeds install -a; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Feed install failed after $attempt attempts"
+              exit 1
+            fi
+            echo "::warning::Feed install failed (attempt $attempt/3); retrying"
+            sleep $((attempt * 10))
+          done
+
+      - name: Load APK signing key
+        env:
+          PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PONWRT_APK_PRIVATE_KEY" ]; then
+            umask 077
+            printf '%s\n' "$PONWRT_APK_PRIVATE_KEY" > "$OPENWRT_PATH/private-key.pem"
+            openssl ec -in "$OPENWRT_PATH/private-key.pem" -pubout -out "$OPENWRT_PATH/public-key.pem"
+            echo "APK signing key loaded"
+          else
+            echo "No PONWRT_APK_PRIVATE_KEY secret configured; using the build system default"
+          fi
 
       - name: Configure XG-040G-TF
         env:
@@ -287,6 +424,9 @@ jobs:
 
           if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
             printf 'CONFIG_ALL_KMODS=y\n' >> "$OPENWRT_PATH/.config"
+          fi
+          if [ "$USE_CCACHE" = "true" ]; then
+            printf 'CONFIG_CCACHE=y\n' >> "$OPENWRT_PATH/.config"
           fi
 
           make -C "$OPENWRT_PATH" defconfig
@@ -338,17 +478,34 @@ jobs:
       - name: Download sources
         working-directory: openwrt
         run: |
-          make download -j"$(nproc)"
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if make download -j"$(nproc)"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::make download failed after $attempt attempts"
+              exit 1
+            fi
+            echo "::warning::make download failed (attempt $attempt/3); removing incomplete files"
+            find dl -size -1024c -type f -delete
+            sleep $((attempt * 10))
+          done
           find dl -size -1024c -type f -delete
 
       - name: Build firmware
         working-directory: openwrt
         run: |
           set -o pipefail
-          if ! make -j"$(nproc)" world 2>&1 | tee "$GITHUB_WORKSPACE/build.log"; then
-            echo "::warning::Parallel build failed; retrying with a verbose single-threaded build"
-            make -j1 V=s world 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          if make -j"$(nproc)" world 2>&1 | tee "$GITHUB_WORKSPACE/build.log"; then
+            exit 0
           fi
+          echo "::warning::Parallel build failed; retrying with a single-threaded build"
+          if make -j1 world 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"; then
+            exit 0
+          fi
+          echo "::warning::Single-threaded build failed; retrying with verbose output"
+          make -j1 V=s world 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
 
       - name: Prepare artifacts
         run: |
@@ -362,22 +519,73 @@ jobs:
             echo "ponwrt_ref=$PONWRT_REF"
             echo "ponwrt_commit=$PONWRT_COMMIT"
             echo "config_hash=$CONFIG_HASH"
+            echo "feed_hash=$FEED_HASH"
             echo "build_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo
             echo "PON data is device-unique and is intentionally not embedded."
             echo "Restore the original bosa and ri backups after flashing."
             echo
             echo "Feed commits:"
-            for feed in packages luci routing telephony video pon_drivers pon_userspace; do
-              feed_path="$OPENWRT_PATH/feeds/$feed"
-              if [ -d "$feed_path/.git" ]; then
-                printf '%s=%s\n' "$feed" "$(git -C "$feed_path" rev-parse HEAD)"
-              fi
-            done
+            while IFS='=' read -r feed_name feed_commit; do
+              [ -n "$feed_name" ] || continue
+              printf '%s=%s\n' "$feed_name" \
+                "$(git -C "$OPENWRT_PATH/feeds/$feed_name" rev-parse HEAD)"
+            done <<< "$FEED_REVISIONS"
           } > "$out/build-manifest.txt"
 
           cp "$OPENWRT_PATH/.config" "$out/build.config"
           cp "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" "$out/base.config"
+
+          package_count=$(find "$OPENWRT_PATH/bin/packages" -type f \
+            \( -name '*.apk' -o -name '*.ipk' \) | wc -l | tr -d ' ')
+          [ "$package_count" -gt 0 ] \
+            || { echo "::error::No compiled package files were found"; exit 1; }
+
+          if [ "$INCLUDE_ALL_PACKAGES" = "true" ]; then
+            package_bundle="$OPENWRT_PATH/package-bundle"
+            package_root="$package_bundle/packages"
+            rm -rf "$package_bundle"
+            mkdir -p "$package_root"
+
+            while IFS= read -r -d '' package_file; do
+              relative="${package_file#$OPENWRT_PATH/bin/packages/}"
+              destination="$package_root/$relative"
+              mkdir -p "$(dirname "$destination")"
+              cp "$package_file" "$destination"
+            done < <(
+              find "$OPENWRT_PATH/bin/packages" -type f -print0
+            )
+
+            cp "$OPENWRT_PATH/.config" "$package_bundle/build.config"
+            cp "$out/build-manifest.txt" "$package_bundle/build-manifest.txt"
+            if [ -f "$OPENWRT_PATH/public-key.pem" ]; then
+              cp "$OPENWRT_PATH/public-key.pem" "$package_bundle/public-key.pem"
+            fi
+            {
+              echo "device=nokia_xg-040g-tf-ubi"
+              echo "ponwrt_commit=$PONWRT_COMMIT"
+              echo "config_hash=$CONFIG_HASH"
+              echo "feed_hash=$FEED_HASH"
+              echo "package_count=$package_count"
+              echo "package_manager=apk"
+              echo
+              echo "Install packages only on a matching PonWrt release."
+            } > "$package_bundle/package-manifest.txt"
+            (
+              cd "$package_bundle"
+              find packages -type f -print0 | sort -z | xargs -0 sha256sum
+            ) > "$package_bundle/SHA256SUMS"
+
+            tar -czf "$out/xg-040g-tf-packages.tar.gz" \
+              -C "$package_bundle" .
+            rm -rf "$package_bundle"
+
+            {
+              echo "- \`xg-040g-tf-packages.tar.gz\` — all compiled APK/IPK packages"
+              echo "- package count: \`$package_count\`"
+              echo "- Install only on the matching PonWrt release"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
             bundle="$OPENWRT_PATH/kmod-bundle"
@@ -389,7 +597,7 @@ jobs:
             # different feeds cannot overwrite one another.
             while IFS= read -r -d '' package_file; do
               relative="${package_file#$OPENWRT_PATH/bin/}"
-              destination="$package_root/$relative"
+              destination="$bundle/$relative"
               mkdir -p "$(dirname "$destination")"
               cp "$package_file" "$destination"
             done < <(
@@ -406,9 +614,14 @@ jobs:
               || { echo "::error::CONFIG_ALL_KMODS produced no kmod packages"; exit 1; }
 
             cp "$OPENWRT_PATH/.config" "$bundle/build.config"
+            if [ -f "$OPENWRT_PATH/public-key.pem" ]; then
+              cp "$OPENWRT_PATH/public-key.pem" "$bundle/public-key.pem"
+            fi
             {
               echo "device=nokia_xg-040g-tf-ubi"
               echo "ponwrt_commit=$PONWRT_COMMIT"
+              echo "config_hash=$CONFIG_HASH"
+              echo "feed_hash=$FEED_HASH"
               echo "kmod_count=$kmod_count"
               echo "package_manager=apk"
               echo
@@ -450,6 +663,8 @@ jobs:
           {
             echo "### Firmware artifacts"
             echo "PonWrt commit: \`$PONWRT_COMMIT\`"
+            echo "Feed fingerprint: \`$FEED_HASH\`"
+            echo "Compiled package count: \`$package_count\`"
             echo "The artifact contains the TF UBI image, recovery image (if generated), config, manifest, and SHA256SUMS."
             echo
             echo "**Important:** \`bosa\` and \`ri\` are per-device data and are not included in this build."
@@ -473,6 +688,7 @@ jobs:
             openwrt/bin/targets/airoha/an7581
             build.log
           if-no-files-found: error
+          compression-level: 0
           retention-days: 30
 
   release:
@@ -501,22 +717,25 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ needs.check-upstream.outputs.release_tag }}
-          name: XG-040G-TF PonWrt ${{ needs.check-upstream.outputs.source_commit_short }} (${{ needs.check-upstream.outputs.config_hash }})
+          name: XG-040G-TF PonWrt ${{ needs.check-upstream.outputs.source_commit_short }} (${{ needs.check-upstream.outputs.config_hash }}-${{ needs.check-upstream.outputs.feed_hash }})
           commit: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: release-assets/openwrt/bin/targets/airoha/an7581/*
           artifactErrorsFailBuild: true
           allowUpdates: false
           replacesArtifacts: false
+          generateReleaseNotes: true
           body: |
             PonWrt firmware for Nokia XG-040G-TF.
 
             - PonWrt ref: `${{ needs.check-upstream.outputs.ponwrt_ref }}`
             - PonWrt commit: `${{ needs.check-upstream.outputs.source_commit }}`
             - Configuration fingerprint: `${{ needs.check-upstream.outputs.config_hash }}`
+            - Feed fingerprint: `${{ needs.check-upstream.outputs.feed_hash }}`
             - Build commit: `${{ github.sha }}`
             - Target: `nokia_xg-040g-tf-ubi`
             - All target-compatible kmods: `${{ needs.check-upstream.outputs.include_all_kmods }}`
+            - Full package archive: `${{ needs.check-upstream.outputs.include_all_packages }}`
 
             Only use kmods from the matching firmware build. Restore the
             device's own PON identity data after flashing.
@@ -547,16 +766,67 @@ jobs:
       - name: Save source commit state
         env:
           SOURCE_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
+          FEED_HASH: ${{ needs.check-upstream.outputs.feed_hash }}
+          CONFIG_HASH: ${{ needs.check-upstream.outputs.config_hash }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mkdir -p ci
-          printf '%s\n' "$SOURCE_COMMIT" > ci/last-built-ponwrt-commit.txt
-          git add ci/last-built-ponwrt-commit.txt
+          cat > ci/last-built-ponwrt-state.env <<EOF
+          source_commit=$SOURCE_COMMIT
+          feed_hash=$FEED_HASH
+          config_hash=$CONFIG_HASH
+          EOF
+          rm -f ci/last-built-ponwrt-commit.txt
+          git add -A ci
           if git diff --cached --quiet; then
             echo "Upstream commit state is already recorded"
             exit 0
           fi
           git commit -m "ci: record successful PonWrt build $SOURCE_COMMIT"
           git push origin HEAD:main
+
+  cleanup-cache:
+    name: Clean old build caches
+    if: >-
+      ${{
+        always() &&
+        needs.check-upstream.outputs.should_build == 'true' &&
+        needs.build.result == 'success' &&
+        needs.record-success.result == 'success'
+      }}
+    needs:
+      - check-upstream
+      - build
+      - release
+      - record-success
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Delete older cache generations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for prefix in ponwrt-dl- ponwrt-ccache- ponwrt-toolchain-; do
+            cache_ids="$(
+              gh cache list \
+                --repo "$GITHUB_REPOSITORY" \
+                --ref "$GITHUB_REF" \
+                --limit 10000 \
+                --sort created_at \
+                --order desc \
+                --json id,key \
+                | jq -r --arg prefix "$prefix" \
+                    '[.[] | select(.key | startswith($prefix))] | .[2:] | .[].id'
+            )"
+            while IFS= read -r cache_id; do
+              [ -n "$cache_id" ] || continue
+              gh cache delete "$cache_id" --repo "$GITHUB_REPOSITORY" --confirm \
+                || echo "::warning::Unable to delete cache $cache_id"
+            done <<< "$cache_ids"
+          done

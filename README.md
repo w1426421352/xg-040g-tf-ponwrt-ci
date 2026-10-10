@@ -12,25 +12,28 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
 
 ## GitHub 云编译
 
-1. 进入 `configs/xg-040g-tf.build.env` 修改源码分支、附加包、是否打包全量 kmod
-   和是否发布 Release：
+1. 进入 `configs/xg-040g-tf.build.env` 修改源码分支、附加包、是否打包全量
+   kmod/软件包、是否启用 ccache 和是否发布 Release：
 
    ```text
    PONWRT_REF="master"
    EXTRA_PACKAGES="luci-app-sqm kmod-tun"
    INCLUDE_ALL_KMODS="true"
+   INCLUDE_ALL_PACKAGES="true"
+   USE_CCACHE="true"
    PUBLISH_RELEASE="true"
    ```
 
    删除基础包时在包名前加 `-`，例如 `EXTRA_PACKAGES="-luci-app-upnp"`。
 2. 推送配置文件到 `main` 会立即触发一次构建。工作流每天北京时间 02:00 检查
-   `PONWRT_REF` 对应的上游提交，只有发现新提交才编译；成功构建后会记录提交状态。
+   `PONWRT_REF`、普通插件 feeds 和 PON feeds 的提交指纹，只有发现源码、feed
+   或配置变化才编译；成功构建后会记录三项状态。
 3. 手动运行时只需要选择 `force_build`，不需要在网页表单里重复填写构建参数。
 4. 编译完成后，在运行页面底部下载 `xg-040g-tf-ponwrt-*` Artifact。先核对
    `SHA256SUMS`，再使用其中的固件文件。
-5. `PUBLISH_RELEASE="true"` 时，工作流会按“PonWrt 提交短 SHA + 配置指纹”创建
-   不可覆盖的 GitHub Release；每次上游提交或配置发生变化都会形成独立归档，旧
-   Release 不会被替换。设为 `false` 时只保留 Actions Artifact。
+5. `PUBLISH_RELEASE="true"` 时，工作流会按“PonWrt 提交短 SHA + 配置指纹 + feed
+   指纹”创建不可覆盖的 GitHub Release；每次上游提交、feed 或配置发生变化都会
+   形成独立归档，旧 Release 不会被替换。设为 `false` 时只保留 Actions Artifact。
 
 工作流不会自动刷写设备，也不会把 PON 身份数据写入产物。
 
@@ -44,12 +47,31 @@ kernel/firmware 伴随包、`.config`、清单和校验文件。
 固件目录中的 `SHA256SUMS` 会覆盖固件、配置文件和这个 ZIP；解压 ZIP 后，可在压缩包根目录
 执行 `sha256sum -c SHA256SUMS` 校验其中的包、清单和构建配置。
 
+启用 `INCLUDE_ALL_PACKAGES="true"` 时，产物还会包含
+`xg-040g-tf-packages.tar.gz`，里面是本次构建生成的全部 `.apk/.ipk` 包、包索引元数据、
+构建配置和公钥（若配置了签名密钥）。压缩包内含 `SHA256SUMS`，可在解压目录执行
+`sha256sum -c SHA256SUMS`；它和 kmod 压缩包一样，只能用于匹配的 PonWrt 提交、feed
+指纹、内核和设备配置。
+
+工作流默认启用 ccache，并在下载失败时自动清理不完整文件后重试；编译失败时依次
+尝试并行、单线程和单线程详细模式。成功构建后会删除 `main` 分支旧的同项目缓存，
+保留最近两代；不同分支的缓存不会互相删除。
+
+如需稳定的 APK 包签名，可在 GitHub Secrets 中设置 `PONWRT_APK_PRIVATE_KEY`。
+未设置时使用构建系统默认密钥。
+
+工作流会在成功后由 `github-actions[bot]` 向 `main` 写入
+`ci/last-built-ponwrt-state.env`；如果仓库分支保护禁止该机器人推送，状态记录会失败，
+后续每日检查可能重复编译，需要为 Actions 允许这一次状态提交。
+
 ## 上游插件兼容性
 
 PonWrt 的 `feeds.conf.default` 仍然使用 ImmortalWrt 的 `packages`、`luci` 和 OpenWrt 的
 `routing`、`telephony`、`video` feeds，同时额外加入 `pon_drivers`、`pon_userspace` 两个
-PON feed。工作流每次构建都会执行 `feeds update -a`、`feeds install -a`，所以普通 LuCI
-插件和用户态程序可以通过 `EXTRA_PACKAGES` 加入固件。
+PON feed。工作流每次构建都会执行 `feeds update -a`、把这些 feed 固定到检测阶段记录的
+精确 commit，再执行 `feeds install -a`，所以普通 LuCI 插件和用户态程序可以通过
+`EXTRA_PACKAGES` 加入固件。若上游修改 `feeds.conf.default`，同步更新
+`configs/xg-040g-tf.build.env` 中的 `PONWRT_FEEDS`。
 
 需要区分三类包：
 
@@ -62,8 +84,9 @@ PON feed。工作流每次构建都会执行 `feeds update -a`、`feeds install 
 PonWrt 的 AN7581 默认配置还会关闭 `luci-app-iptv`，因此本仓库也不强制内置它；确实需要
 时再把 `luci-app-iptv` 放进 `EXTRA_PACKAGES`，让 CI 验证它在当前 feed 组合下能否编译。
 
-工作流会在 `make defconfig` 后验证附加包仍然存在，把所有 feed 的 commit 和 PonWrt
-提交写入 `build-manifest.txt`，并在成功后更新 `ci/last-built-ponwrt-commit.txt`。
+工作流会在 `make defconfig` 后验证附加包仍然存在，把所有 feed 的 commit、PonWrt
+提交和配置指纹写入 `build-manifest.txt`，并在成功后更新
+`ci/last-built-ponwrt-state.env`。
 这能避免上游插件改名、依赖不满足或被 Kconfig 静默移除后仍产出错误固件。
 
 ## PON 数据必须先备份
