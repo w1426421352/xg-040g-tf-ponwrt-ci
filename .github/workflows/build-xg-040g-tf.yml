@@ -249,11 +249,6 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/openwrt/.ccache
 
     steps:
-      - name: Check out build configuration
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
       - name: Maximize build space and add swap
         uses: easimon/maximize-build-space@master
         with:
@@ -265,6 +260,11 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get clean
+
+      - name: Check out build configuration
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         env:
