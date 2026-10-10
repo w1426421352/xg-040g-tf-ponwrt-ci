@@ -28,8 +28,9 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
 3. 手动运行时只需要选择 `force_build`，不需要在网页表单里重复填写构建参数。
 4. 编译完成后，在运行页面底部下载 `xg-040g-tf-ponwrt-*` Artifact。先核对
    `SHA256SUMS`，再使用其中的固件文件。
-5. `PUBLISH_RELEASE="true"` 时，工作流会按 PonWrt 提交短 SHA 创建或更新 GitHub
-   Release；设为 `false` 时只保留 Actions Artifact。
+5. `PUBLISH_RELEASE="true"` 时，工作流会按“PonWrt 提交短 SHA + 配置指纹”创建
+   不可覆盖的 GitHub Release；每次上游提交或配置发生变化都会形成独立归档，旧
+   Release 不会被替换。设为 `false` 时只保留 Actions Artifact。
 
 工作流不会自动刷写设备，也不会把 PON 身份数据写入产物。
 

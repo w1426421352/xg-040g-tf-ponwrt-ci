@@ -45,6 +45,8 @@ jobs:
       release_prefix: ${{ steps.resolve.outputs.release_prefix }}
       source_commit: ${{ steps.resolve.outputs.source_commit }}
       source_commit_short: ${{ steps.resolve.outputs.source_commit_short }}
+      config_hash: ${{ steps.resolve.outputs.config_hash }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
     env:
       EVENT_NAME: ${{ github.event_name }}
       FORCE_BUILD: ${{ inputs.force_build || false }}
@@ -68,6 +70,13 @@ jobs:
           : "${INCLUDE_ALL_KMODS:?INCLUDE_ALL_KMODS is required}"
           : "${PUBLISH_RELEASE:?PUBLISH_RELEASE is required}"
           : "${RELEASE_PREFIX:?RELEASE_PREFIX is required}"
+
+          config_hash="$(
+            {
+              sha256sum "$config" | awk '{print $1}'
+              sha256sum "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" | awk '{print $1}'
+            } | sha256sum | cut -c1-12
+          )"
 
           resolve_ref() {
             if [[ "$PONWRT_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -143,6 +152,8 @@ jobs:
             echo "release_prefix=$RELEASE_PREFIX"
             echo "source_commit=$source_commit"
             echo "source_commit_short=${source_commit:0:12}"
+            echo "config_hash=$config_hash"
+            echo "release_tag=${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -152,6 +163,8 @@ jobs:
             echo "- Resolved commit: \`$source_commit\`"
             echo "- Previously built: \`${last_commit:-none}\`"
             echo "- Build required: \`$should_build\`"
+            echo "- Configuration fingerprint: \`$config_hash\`"
+            echo "- Immutable release tag: \`${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
@@ -163,7 +176,9 @@ jobs:
     env:
       PONWRT_REPO: ${{ needs.check-upstream.outputs.ponwrt_repo }}
       PONWRT_REF: ${{ needs.check-upstream.outputs.ponwrt_ref }}
+      PONWRT_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
       INCLUDE_ALL_KMODS: ${{ needs.check-upstream.outputs.include_all_kmods }}
+      CONFIG_HASH: ${{ needs.check-upstream.outputs.config_hash }}
 
     steps:
       - name: Check out build configuration
@@ -216,7 +231,8 @@ jobs:
             if git init openwrt \
               && git -C openwrt remote add origin "$PONWRT_REPO" \
               && git -C openwrt fetch --depth=1 origin "$PONWRT_REF" \
-              && git -C openwrt checkout --detach FETCH_HEAD; then
+              && test "$(git -C openwrt rev-parse FETCH_HEAD)" = "$PONWRT_COMMIT" \
+              && git -C openwrt checkout --detach "$PONWRT_COMMIT"; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -345,6 +361,7 @@ jobs:
             echo "ponwrt_repo=$PONWRT_REPO"
             echo "ponwrt_ref=$PONWRT_REF"
             echo "ponwrt_commit=$PONWRT_COMMIT"
+            echo "config_hash=$CONFIG_HASH"
             echo "build_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo
             echo "PON data is device-unique and is intentionally not embedded."
@@ -483,19 +500,20 @@ jobs:
       - name: Publish release
         uses: ncipollo/release-action@v1
         with:
-          tag: ${{ needs.check-upstream.outputs.release_prefix }}-${{ needs.check-upstream.outputs.source_commit_short }}
-          name: XG-040G-TF PonWrt ${{ needs.check-upstream.outputs.source_commit_short }}
+          tag: ${{ needs.check-upstream.outputs.release_tag }}
+          name: XG-040G-TF PonWrt ${{ needs.check-upstream.outputs.source_commit_short }} (${{ needs.check-upstream.outputs.config_hash }})
           commit: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: release-assets/openwrt/bin/targets/airoha/an7581/*
           artifactErrorsFailBuild: true
           allowUpdates: false
-          replacesArtifacts: true
+          replacesArtifacts: false
           body: |
             PonWrt firmware for Nokia XG-040G-TF.
 
             - PonWrt ref: `${{ needs.check-upstream.outputs.ponwrt_ref }}`
             - PonWrt commit: `${{ needs.check-upstream.outputs.source_commit }}`
+            - Configuration fingerprint: `${{ needs.check-upstream.outputs.config_hash }}`
             - Build commit: `${{ github.sha }}`
             - Target: `nokia_xg-040g-tf-ubi`
             - All target-compatible kmods: `${{ needs.check-upstream.outputs.include_all_kmods }}`
