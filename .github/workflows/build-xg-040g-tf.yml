@@ -40,6 +40,7 @@ jobs:
       ponwrt_repo: ${{ steps.resolve.outputs.ponwrt_repo }}
       ponwrt_ref: ${{ steps.resolve.outputs.ponwrt_ref }}
       extra_packages: ${{ steps.resolve.outputs.extra_packages }}
+      exclude_kmods: ${{ steps.resolve.outputs.exclude_kmods }}
       include_all_kmods: ${{ steps.resolve.outputs.include_all_kmods }}
       include_all_packages: ${{ steps.resolve.outputs.include_all_packages }}
       use_ccache: ${{ steps.resolve.outputs.use_ccache }}
@@ -80,6 +81,15 @@ jobs:
             echo "::error::PONWRT_FEEDS must contain at least one feed"
             exit 1
           }
+
+          set -f
+          for package in $EXCLUDE_KMODS; do
+            [[ "$package" =~ ^kmod-[A-Za-z0-9_.-]+$ ]] || {
+              echo "::error::Invalid EXCLUDE_KMODS entry: $package"
+              exit 1
+            }
+          done
+          set +f
 
           config_hash="$(
             printf '%s\n' \
@@ -198,6 +208,7 @@ jobs:
             echo "ponwrt_repo=$PONWRT_REPO"
             echo "ponwrt_ref=$PONWRT_REF"
             echo "extra_packages=$EXTRA_PACKAGES"
+            echo "exclude_kmods=$EXCLUDE_KMODS"
             echo "include_all_kmods=$INCLUDE_ALL_KMODS"
             echo "publish_release=$PUBLISH_RELEASE"
             echo "release_prefix=$RELEASE_PREFIX"
@@ -240,6 +251,7 @@ jobs:
       PONWRT_REPO: ${{ needs.check-upstream.outputs.ponwrt_repo }}
       PONWRT_REF: ${{ needs.check-upstream.outputs.ponwrt_ref }}
       PONWRT_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
+      EXCLUDE_KMODS: ${{ needs.check-upstream.outputs.exclude_kmods }}
       INCLUDE_ALL_KMODS: ${{ needs.check-upstream.outputs.include_all_kmods }}
       INCLUDE_ALL_PACKAGES: ${{ needs.check-upstream.outputs.include_all_packages }}
       USE_CCACHE: ${{ needs.check-upstream.outputs.use_ccache }}
@@ -431,6 +443,23 @@ jobs:
 
           make -C "$OPENWRT_PATH" defconfig
 
+          # CONFIG_ALL_KMODS expands to every package visible in the feeds,
+          # including modules that are not compatible with this kernel tree.
+          # Apply configured exclusions after defconfig so they remain explicit
+          # n selections in the final build configuration.
+          set -f
+          for package in $EXCLUDE_KMODS; do
+            [[ "$package" =~ ^kmod-[A-Za-z0-9_.-]+$ ]] || {
+              echo "::error::Invalid EXCLUDE_KMODS entry: $package"
+              exit 1
+            }
+            sed -i -E "/^CONFIG_PACKAGE_${package}(=| is not set)/d" \
+              "$OPENWRT_PATH/.config"
+            printf '# CONFIG_PACKAGE_%s is not set\n' "$package" \
+              >> "$OPENWRT_PATH/.config"
+          done
+          set +f
+
           grep -q '^CONFIG_TARGET_airoha_an7581_DEVICE_nokia_xg-040g-tf-ubi=y$' \
             "$OPENWRT_PATH/.config" \
             || { echo "::error::TF device profile was not selected"; exit 1; }
@@ -439,6 +468,14 @@ jobs:
             grep -q '^CONFIG_ALL_KMODS=y$' "$OPENWRT_PATH/.config" \
               || { echo "::error::CONFIG_ALL_KMODS was dropped by defconfig"; exit 1; }
           fi
+
+          set -f
+          for package in $EXCLUDE_KMODS; do
+            grep -q "^# CONFIG_PACKAGE_${package} is not set$" \
+              "$OPENWRT_PATH/.config" \
+              || { echo "::error::Excluded kmod was selected: $package"; exit 1; }
+          done
+          set +f
 
           required_packages="
             kmod-airoha-pon-frontend
@@ -470,6 +507,7 @@ jobs:
             echo "- Required PON packages: verified"
             echo "- Package manager: \`apk\`"
             echo "- All target-compatible kmods: \`$INCLUDE_ALL_KMODS\`"
+            echo "- Excluded unbuildable kmods: \`${EXCLUDE_KMODS:-none}\`"
             if [ -n "$requested_packages" ]; then
               echo "- Extra packages: verified after \`make defconfig\`"
             fi
@@ -520,6 +558,7 @@ jobs:
             echo "ponwrt_commit=$PONWRT_COMMIT"
             echo "config_hash=$CONFIG_HASH"
             echo "feed_hash=$FEED_HASH"
+            echo "exclude_kmods=${EXCLUDE_KMODS:-}"
             echo "build_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo
             echo "PON data is device-unique and is intentionally not embedded."
@@ -622,6 +661,7 @@ jobs:
               echo "ponwrt_commit=$PONWRT_COMMIT"
               echo "config_hash=$CONFIG_HASH"
               echo "feed_hash=$FEED_HASH"
+              echo "exclude_kmods=${EXCLUDE_KMODS:-}"
               echo "kmod_count=$kmod_count"
               echo "package_manager=apk"
               echo

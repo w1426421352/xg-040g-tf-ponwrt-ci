@@ -18,6 +18,7 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
    ```text
    PONWRT_REF="master"
    EXTRA_PACKAGES="luci-app-sqm kmod-tun"
+   EXCLUDE_KMODS="kmod-ipt-rtpengine"
    INCLUDE_ALL_KMODS="true"
    INCLUDE_ALL_PACKAGES="true"
    USE_CCACHE="true"
@@ -25,6 +26,8 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
    ```
 
    删除基础包时在包名前加 `-`，例如 `EXTRA_PACKAGES="-luci-app-upnp"`。
+   `EXCLUDE_KMODS` 用于从全量 kmod 扩展中排除当前 PonWrt 内核树无法编译的模块；
+   它只接受 `kmod-*` 包名，并会写入最终 `.config` 作为显式禁用项。
 2. 推送配置文件到 `main` 会立即触发一次构建。工作流每天北京时间 02:00 检查
    `PONWRT_REF`、普通插件 feeds 和 PON feeds 的提交指纹，只有发现源码、feed
    或配置变化才编译；成功构建后会记录三项状态。
@@ -40,6 +43,10 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
 将 `INCLUDE_ALL_KMODS="true"` 时，CI 会启用 `CONFIG_ALL_KMODS=y`，额外生成
 `xg-040g-kmods.zip`。压缩包里包含本次构建生成的全部目标兼容 `kmod-*` 包，以及匹配的
 kernel/firmware 伴随包、`.config`、清单和校验文件。
+
+这里的“全部”是“全部可编译 kmod”。例如当前 PonWrt 6.18 内核树缺少
+`linux/netfilter/xt_RTPENGINE.h`，所以默认通过 `EXCLUDE_KMODS` 排除
+`kmod-ipt-rtpengine`；这不会影响 XG-040G-TF 所需的 PON 驱动和用户态组件。
 
 这个压缩包不是通用驱动仓库，只能用于同一 PonWrt 提交、同一内核配置和同一设备固件。
 不要把其他 OpenWrt/ImmortalWrt 版本的 kmod 混进来；升级到新的固件后，应重新生成对应
