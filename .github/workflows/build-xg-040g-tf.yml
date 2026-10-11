@@ -726,7 +726,7 @@ jobs:
             echo "PonWrt commit: \`$PONWRT_COMMIT\`"
             echo "Feed fingerprint: \`$FEED_HASH\`"
             echo "Compiled package count: \`$package_count\`"
-            echo "The artifact contains the TF UBI image, recovery image (if generated), config, manifest, and SHA256SUMS."
+            echo "The artifact contains the TF UBI image, recovery image (if generated), config, manifest, and xg-040g-tf.SHA256SUMS."
             echo
             echo "**Important:** \`bosa\` and \`ri\` are per-device data and are not included in this build."
             if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
@@ -739,7 +739,7 @@ jobs:
             find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
               | sort -z \
               | xargs -0 sha256sum
-          ) > "$out/SHA256SUMS"
+          ) > "$out/xg-040g-tf.SHA256SUMS"
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
@@ -788,6 +788,17 @@ jobs:
           while IFS= read -r -d '' artifact; do
             cp "$artifact" "$release_dir/"
           done < <(find "$source_dir" -maxdepth 1 -type f -print0 | sort -z)
+
+          declare -A seen_names=()
+          while IFS= read -r -d '' artifact; do
+            name="$(basename "$artifact")"
+            normalized="${name,,}"
+            if [ -n "${seen_names[$normalized]:-}" ]; then
+              echo "::error::Release assets collide case-insensitively: ${seen_names[$normalized]} and $name"
+              exit 1
+            fi
+            seen_names["$normalized"]="$name"
+          done < <(find "$release_dir" -maxdepth 1 -type f -print0)
 
           find "$release_dir" -maxdepth 1 -type f -print
           test -n "$(find "$release_dir" -maxdepth 1 -type f -print -quit)"
