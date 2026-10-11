@@ -647,10 +647,31 @@ jobs:
                 -print0
             )
 
-            kmod_count=$(find "$package_root" -type f \
-              \( -name 'kmod-*.apk' -o -name 'kmod-*.ipk' \) | wc -l)
+            # The bundle mirrors the complete bin/ tree.  Target-specific
+            # packages live below targets/, while feed packages live below
+            # packages/, so counting only "$package_root" can report zero
+            # even after the copy above succeeded.
+            kmod_count=$(find "$bundle" -type f \
+              \( -name 'kmod-*.apk' -o -name 'kmod-*.ipk' \) \
+              | wc -l | tr -d ' ')
             [ "$kmod_count" -gt 0 ] \
-              || { echo "::error::CONFIG_ALL_KMODS produced no kmod packages"; exit 1; }
+              || {
+                echo "::error::CONFIG_ALL_KMODS produced no kmod packages"
+                echo "Collected package paths:"
+                find "$bundle" -type f \
+                  \( -name 'kmod-*.apk' -o -name 'kmod-*.ipk' \
+                     -o -name 'kernel*.apk' -o -name 'kernel*.ipk' \
+                     -o -name '*-firmware*.apk' -o -name '*-firmware*.ipk' \) \
+                  -print | sort
+                exit 1
+              }
+
+            echo "Collected kmod/kernel/firmware packages:"
+            find "$bundle" -type f \
+              \( -name 'kmod-*.apk' -o -name 'kmod-*.ipk' \
+                 -o -name 'kernel*.apk' -o -name 'kernel*.ipk' \
+                 -o -name '*-firmware*.apk' -o -name '*-firmware*.ipk' \) \
+              -print | sort
 
             cp "$OPENWRT_PATH/.config" "$bundle/build.config"
             if [ -f "$OPENWRT_PATH/public-key.pem" ]; then
