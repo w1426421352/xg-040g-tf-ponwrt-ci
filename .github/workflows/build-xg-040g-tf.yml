@@ -774,6 +774,24 @@ jobs:
           name: xg-040g-tf-ponwrt-${{ github.run_number }}
           path: release-assets
 
+      - name: Stage release files
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/release-assets/openwrt/bin/targets/airoha/an7581"
+          release_dir="$GITHUB_WORKSPACE/release-files"
+          test -d "$source_dir"
+          rm -rf "$release_dir"
+          mkdir -p "$release_dir"
+
+          # The target directory also contains package indexes and feed
+          # subdirectories.  Release attachments must be regular files only.
+          while IFS= read -r -d '' artifact; do
+            cp "$artifact" "$release_dir/"
+          done < <(find "$source_dir" -maxdepth 1 -type f -print0 | sort -z)
+
+          find "$release_dir" -maxdepth 1 -type f -print
+          test -n "$(find "$release_dir" -maxdepth 1 -type f -print -quit)"
+
       - name: Publish release
         uses: ncipollo/release-action@v1
         with:
@@ -781,10 +799,12 @@ jobs:
           name: XG-040G-TF PonWrt ${{ needs.check-upstream.outputs.source_commit_short }} (${{ needs.check-upstream.outputs.config_hash }}-${{ needs.check-upstream.outputs.feed_hash }})
           commit: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: release-assets/openwrt/bin/targets/airoha/an7581/*
+          artifacts: release-files/*
           artifactErrorsFailBuild: true
-          allowUpdates: false
-          replacesArtifacts: false
+          # The tag contains the full source/config/feed fingerprint, so an
+          # update can only repair this exact immutable build record.
+          allowUpdates: true
+          replacesArtifacts: true
           generateReleaseNotes: true
           body: |
             PonWrt firmware for Nokia XG-040G-TF.
