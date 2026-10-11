@@ -792,6 +792,29 @@ jobs:
           find "$release_dir" -maxdepth 1 -type f -print
           test -n "$(find "$release_dir" -maxdepth 1 -type f -print -quit)"
 
+      - name: Remove stale release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          asset_names="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' 2>/dev/null || true)"
+          if [ -z "$asset_names" ]; then
+            echo "No existing assets for $RELEASE_TAG"
+            exit 0
+          fi
+
+          while IFS= read -r asset_name; do
+            [ -n "$asset_name" ] || continue
+            echo "Removing stale release asset: $asset_name"
+            gh release delete-asset "$RELEASE_TAG" "$asset_name" \
+              --repo "$GITHUB_REPOSITORY" \
+              --yes
+          done <<< "$asset_names"
+
       - name: Publish release
         uses: ncipollo/release-action@v1
         with:
