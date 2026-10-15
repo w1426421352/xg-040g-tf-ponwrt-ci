@@ -1,6 +1,7 @@
-# XG-040G-TF PonWrt 云编译
+# PonWrt 多机型云编译
 
-这个仓库只负责给 Nokia `XG-040G-TF` 编译 PonWrt 固件，目标 profile 固定为：
+这个仓库用于给多个 Airoha/PonWrt 设备编译固件。当前默认机型是 Nokia
+`XG-040G-TF`，目标 profile 为：
 
 ```text
 nokia_xg-040g-tf-ubi
@@ -12,7 +13,7 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
 
 ## GitHub 云编译
 
-1. 进入 `configs/xg-040g-tf.build.env` 修改源码分支、附加包、是否打包全量
+1. 进入对应机型的 `configs/<model>.build.env` 修改源码分支、附加包、是否打包全量
    kmod/软件包、是否启用 ccache 和是否发布 Release：
 
    ```text
@@ -25,23 +26,34 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
    PUBLISH_RELEASE="true"
    ```
 
+   `<model>.build.env` 还定义了机型名称、目标 Kconfig、产物目录和必须的软件包。
+   例如当前配置文件是 `configs/xg-040g-tf.build.env`，配套的 OpenWrt 配置是
+   `configs/xg-040g-tf.config`。新增机型时复制这两个文件并修改其中的
+   `MODEL_ID`、`TARGET_CONFIG_SYMBOL`、`TARGET_SUBDIR`、`ARTIFACT_PREFIX` 和
+   `REQUIRED_PACKAGES`。
+
    删除基础包时在包名前加 `-`，例如 `EXTRA_PACKAGES="-luci-app-upnp"`。
    `EXCLUDE_KMODS` 用于从全量 kmod 扩展中排除当前 PonWrt 内核树无法编译的模块；
    它只接受 `kmod-*` 包名，并会写入最终 `.config` 作为显式禁用项。
 2. 推送配置文件到 `main` 会立即触发一次构建。工作流每天北京时间 02:00 检查
    `PONWRT_REF`、普通插件 feeds 和 PON feeds 的提交指纹，只有发现源码、feed
    或配置变化才编译；成功构建后会记录三项状态。
-3. 手动运行时只需要选择 `force_build`，不需要在网页表单里重复填写构建参数。
-4. 编译完成后，在运行页面底部下载 `xg-040g-tf-ponwrt-*` Artifact。先核对
+3. 手动运行时选择 `model`（配置文件前缀）和 `force_build`；其他构建参数继续由
+   对应的 `configs/<model>.build.env` 管理。
+4. 编译完成后，在运行页面底部下载 `<model>-ponwrt-*` Artifact。先核对
    `SHA256SUMS`，再使用其中的固件文件。
-5. `PUBLISH_RELEASE="true"` 时，工作流会按“PonWrt 提交短 SHA + 配置指纹 + feed
+5. 手动运行工作流时，在 `model` 输入中填写配置文件前缀，例如 `xg-040g-tf`；
+   定时和推送触发默认使用 `xg-040g-tf`。`PUBLISH_RELEASE="true"` 时，工作流会按“机型
+   + PonWrt 提交短 SHA + 配置指纹 + feed
    指纹”创建不可覆盖的 GitHub Release；每次上游提交、feed 或配置发生变化都会
-   形成独立归档，旧 Release 不会被替换。设为 `false` 时只保留 Actions Artifact。
+   形成独立归档，旧 Release 不会被替换。成功创建的 Release 会显式标记为
+   GitHub `latest`，说明同时提供中文和 English 两部分。设为 `false` 时只保留
+   Actions Artifact。
 
 工作流不会自动刷写设备，也不会把 PON 身份数据写入产物。
 
 将 `INCLUDE_ALL_KMODS="true"` 时，CI 会启用 `CONFIG_ALL_KMODS=y`，额外生成
-`xg-040g-kmods.zip`。压缩包里包含本次构建生成的全部目标兼容 `kmod-*` 包，以及匹配的
+`<artifact-prefix>-kmods.zip`。压缩包里包含本次构建生成的全部目标兼容 `kmod-*` 包，以及匹配的
 kernel/firmware 伴随包、`.config`、清单和校验文件。
 
 这里的“全部”是“全部可编译 kmod”。例如当前 PonWrt 6.18 内核树缺少
@@ -55,7 +67,7 @@ kernel/firmware 伴随包、`.config`、清单和校验文件。
 执行 `sha256sum -c SHA256SUMS` 校验其中的包、清单和构建配置。
 
 启用 `INCLUDE_ALL_PACKAGES="true"` 时，产物还会包含
-`xg-040g-tf-packages.tar.gz`，里面是本次构建生成的全部 `.apk/.ipk` 包、包索引元数据、
+`<artifact-prefix>-packages.tar.gz`，里面是本次构建生成的全部 `.apk/.ipk` 包、包索引元数据、
 构建配置和公钥（若配置了签名密钥）。压缩包内含 `SHA256SUMS`，可在解压目录执行
 `sha256sum -c SHA256SUMS`；它和 kmod 压缩包一样，只能用于匹配的 PonWrt 提交、feed
 指纹、内核和设备配置。
@@ -67,8 +79,8 @@ kernel/firmware 伴随包、`.config`、清单和校验文件。
 如需稳定的 APK 包签名，可在 GitHub Secrets 中设置 `PONWRT_APK_PRIVATE_KEY`。
 未设置时使用构建系统默认密钥。
 
-工作流会在成功后由 `github-actions[bot]` 向 `main` 写入
-`ci/last-built-ponwrt-state.env`；如果仓库分支保护禁止该机器人推送，状态记录会失败，
+工作流会在成功后由 `github-actions[bot]` 向 `main` 写入按机型区分的
+`ci/last-built-ponwrt-state-<model>.env`；如果仓库分支保护禁止该机器人推送，状态记录会失败，
 后续每日检查可能重复编译，需要为 Actions 允许这一次状态提交。
 
 ## 上游插件兼容性
@@ -136,7 +148,8 @@ make defconfig
 make -j"$(nproc)" world
 ```
 
-产物在 `openwrt/bin/targets/airoha/an7581/`。
+产物在 `openwrt/bin/targets/<target-subdir>/`，当前 XG-040G-TF 为
+`openwrt/bin/targets/airoha/an7581/`。
 
 ## 风险边界
 

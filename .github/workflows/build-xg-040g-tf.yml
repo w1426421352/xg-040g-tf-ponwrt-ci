@@ -1,6 +1,6 @@
-name: Build PonWrt for XG-040G-TF
+name: Build PonWrt firmware
 
-run-name: XG-040G-TF PonWrt · ${{ github.event_name }}
+run-name: ${{ inputs.model || 'xg-040g-tf' }} PonWrt · ${{ github.event_name }}
 
 on:
   schedule:
@@ -11,10 +11,14 @@ on:
       - main
     paths:
       - ".github/workflows/build-xg-040g-tf.yml"
-      - "configs/xg-040g-tf.build.env"
-      - "configs/xg-040g-tf.config"
+      - "configs/**"
   workflow_dispatch:
     inputs:
+      model:
+        description: "Model profile under configs/<model>.build.env"
+        required: true
+        default: "xg-040g-tf"
+        type: string
       force_build:
         description: "Build even when the configured PonWrt commit has not changed"
         required: true
@@ -25,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: xg-040g-tf-${{ github.ref }}
+  group: ponwrt-${{ inputs.model || 'xg-040g-tf' }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -52,8 +56,16 @@ jobs:
       feed_hash: ${{ steps.resolve.outputs.feed_hash }}
       feed_revisions: ${{ steps.resolve.outputs.feed_revisions }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
+      model_id: ${{ steps.resolve.outputs.model_id }}
+      model_name_en: ${{ steps.resolve.outputs.model_name_en }}
+      model_name_zh: ${{ steps.resolve.outputs.model_name_zh }}
+      target_config_symbol: ${{ steps.resolve.outputs.target_config_symbol }}
+      target_subdir: ${{ steps.resolve.outputs.target_subdir }}
+      artifact_prefix: ${{ steps.resolve.outputs.artifact_prefix }}
+      required_packages: ${{ steps.resolve.outputs.required_packages }}
     env:
       EVENT_NAME: ${{ github.event_name }}
+      MODEL_INPUT: ${{ inputs.model || 'xg-040g-tf' }}
       FORCE_BUILD: ${{ inputs.force_build || false }}
 
     steps:
@@ -66,10 +78,35 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          config="$GITHUB_WORKSPACE/configs/xg-040g-tf.build.env"
+          model="$MODEL_INPUT"
+          [[ "$model" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || {
+            echo "::error::Invalid model name: $model"
+            exit 1
+          }
+          config="$GITHUB_WORKSPACE/configs/$model.build.env"
+          model_config="$GITHUB_WORKSPACE/configs/$model.config"
+          [ -f "$config" ] || {
+            echo "::error::Missing model build configuration: $config"
+            exit 1
+          }
+          [ -f "$model_config" ] || {
+            echo "::error::Missing model OpenWrt configuration: $model_config"
+            exit 1
+          }
           # shellcheck disable=SC1090
           source "$config"
 
+          : "${MODEL_ID:?MODEL_ID is required}"
+          : "${MODEL_NAME_EN:?MODEL_NAME_EN is required}"
+          : "${MODEL_NAME_ZH:?MODEL_NAME_ZH is required}"
+          : "${TARGET_CONFIG_SYMBOL:?TARGET_CONFIG_SYMBOL is required}"
+          : "${TARGET_SUBDIR:?TARGET_SUBDIR is required}"
+          : "${ARTIFACT_PREFIX:?ARTIFACT_PREFIX is required}"
+          : "${REQUIRED_PACKAGES:?REQUIRED_PACKAGES is required}"
+          [ "$MODEL_ID" = "$model" ] || {
+            echo "::error::MODEL_ID ($MODEL_ID) must match selected model ($model)"
+            exit 1
+          }
           : "${PONWRT_REPO:?PONWRT_REPO is required}"
           : "${PONWRT_REF:?PONWRT_REF is required}"
           : "${INCLUDE_ALL_KMODS:?INCLUDE_ALL_KMODS is required}"
@@ -94,7 +131,7 @@ jobs:
           config_hash="$(
             printf '%s\n' \
               "$(sha256sum "$config" | awk '{print $1}')" \
-              "$(sha256sum "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" | awk '{print $1}')" \
+              "$(sha256sum "$model_config" | awk '{print $1}')" \
               | sha256sum | cut -c1-12
           )"
 
@@ -163,20 +200,23 @@ jobs:
           last_source_commit=""
           last_feed_hash=""
           last_config_hash=""
-          state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-state.env"
+          last_model_id=""
+          state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-state-$MODEL_ID.env"
           if [ -s "$state_file" ]; then
             while IFS='=' read -r state_key state_value; do
               case "$state_key" in
                 source_commit) last_source_commit="$state_value" ;;
                 feed_hash) last_feed_hash="$state_value" ;;
                 config_hash) last_config_hash="$state_value" ;;
+                model_id) last_model_id="$state_value" ;;
               esac
             done < "$state_file"
           elif [ -s "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt" ]; then
             last_source_commit="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt")"
           fi
           state_changed=false
-          if [ "$source_commit" != "$last_source_commit" ] ||
+          if [ "$MODEL_ID" != "$last_model_id" ] ||
+             [ "$source_commit" != "$last_source_commit" ] ||
              [ "$feed_hash" != "$last_feed_hash" ] ||
              [ "$config_hash" != "$last_config_hash" ]; then
             state_changed=true
@@ -205,6 +245,13 @@ jobs:
 
           {
             echo "should_build=$should_build"
+            echo "model_id=$MODEL_ID"
+            echo "model_name_en=$MODEL_NAME_EN"
+            echo "model_name_zh=$MODEL_NAME_ZH"
+            echo "target_config_symbol=$TARGET_CONFIG_SYMBOL"
+            echo "target_subdir=$TARGET_SUBDIR"
+            echo "artifact_prefix=$ARTIFACT_PREFIX"
+            echo "required_packages=$REQUIRED_PACKAGES"
             echo "ponwrt_repo=$PONWRT_REPO"
             echo "ponwrt_ref=$PONWRT_REF"
             echo "extra_packages=$EXTRA_PACKAGES"
@@ -227,10 +274,12 @@ jobs:
 
           {
             echo "### Upstream check"
+            echo "- Model / 型号: \`$MODEL_NAME_ZH / $MODEL_NAME_EN\` (\`$MODEL_ID\`)"
             echo "- Source: \`$PONWRT_REPO\`"
             echo "- Ref: \`$PONWRT_REF\`"
             echo "- Resolved commit: \`$source_commit\`"
             echo "- Previously built source: \`${last_source_commit:-none}\`"
+            echo "- Previously built model: \`${last_model_id:-none}\`"
             echo "- Previously built feed hash: \`${last_feed_hash:-none}\`"
             echo "- Previous configuration fingerprint: \`${last_config_hash:-none}\`"
             echo "- Build required: \`$should_build\`"
@@ -242,7 +291,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    name: Build nokia_xg-040g-tf-ubi
+    name: Build ${{ needs.check-upstream.outputs.model_name_en }}
     if: ${{ needs.check-upstream.outputs.should_build == 'true' }}
     needs: check-upstream
     runs-on: ubuntu-24.04
@@ -251,6 +300,13 @@ jobs:
       PONWRT_REPO: ${{ needs.check-upstream.outputs.ponwrt_repo }}
       PONWRT_REF: ${{ needs.check-upstream.outputs.ponwrt_ref }}
       PONWRT_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
+      MODEL_ID: ${{ needs.check-upstream.outputs.model_id }}
+      MODEL_NAME_EN: ${{ needs.check-upstream.outputs.model_name_en }}
+      MODEL_NAME_ZH: ${{ needs.check-upstream.outputs.model_name_zh }}
+      TARGET_CONFIG_SYMBOL: ${{ needs.check-upstream.outputs.target_config_symbol }}
+      TARGET_SUBDIR: ${{ needs.check-upstream.outputs.target_subdir }}
+      ARTIFACT_PREFIX: ${{ needs.check-upstream.outputs.artifact_prefix }}
+      REQUIRED_PACKAGES: ${{ needs.check-upstream.outputs.required_packages }}
       EXCLUDE_KMODS: ${{ needs.check-upstream.outputs.exclude_kmods }}
       INCLUDE_ALL_KMODS: ${{ needs.check-upstream.outputs.include_all_kmods }}
       INCLUDE_ALL_PACKAGES: ${{ needs.check-upstream.outputs.include_all_packages }}
@@ -321,7 +377,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: openwrt/dl
-          key: ponwrt-dl-${{ hashFiles('configs/xg-040g-tf.build.env', 'configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          key: ponwrt-dl-${{ hashFiles('configs/**', '.github/workflows/build-xg-040g-tf.yml') }}
           restore-keys: |
             ponwrt-dl-
 
@@ -330,7 +386,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: openwrt/.ccache
-          key: ponwrt-ccache-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/xg-040g-tf.build.env', 'configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          key: ponwrt-ccache-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/**', '.github/workflows/build-xg-040g-tf.yml') }}
           restore-keys: |
             ponwrt-ccache-${{ env.PONWRT_COMMIT }}-
             ponwrt-ccache-
@@ -341,7 +397,7 @@ jobs:
           path: |
             openwrt/staging_dir/host*
             openwrt/staging_dir/toolchain-*
-          key: ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/xg-040g-tf.build.env', 'configs/xg-040g-tf.config', '.github/workflows/build-xg-040g-tf.yml') }}
+          key: ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-${{ hashFiles('configs/**', '.github/workflows/build-xg-040g-tf.yml') }}
           restore-keys: |
             ponwrt-toolchain-${{ runner.os }}-${{ env.PONWRT_COMMIT }}-
 
@@ -410,12 +466,12 @@ jobs:
             echo "No PONWRT_APK_PRIVATE_KEY secret configured; using the build system default"
           fi
 
-      - name: Configure XG-040G-TF
+      - name: Configure selected model
         env:
           EXTRA_PACKAGES: ${{ needs.check-upstream.outputs.extra_packages }}
         run: |
           set -euo pipefail
-          cp "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" "$OPENWRT_PATH/.config"
+          cp "$GITHUB_WORKSPACE/configs/$MODEL_ID.config" "$OPENWRT_PATH/.config"
 
           # Keep package names data-only: no shell fragments are accepted here.
           set -f
@@ -460,9 +516,9 @@ jobs:
           done
           set +f
 
-          grep -q '^CONFIG_TARGET_airoha_an7581_DEVICE_nokia_xg-040g-tf-ubi=y$' \
+          grep -q "^${TARGET_CONFIG_SYMBOL}=y$" \
             "$OPENWRT_PATH/.config" \
-            || { echo "::error::TF device profile was not selected"; exit 1; }
+            || { echo "::error::Configured device profile was not selected: $TARGET_CONFIG_SYMBOL"; exit 1; }
 
           if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
             grep -q '^CONFIG_ALL_KMODS=y$' "$OPENWRT_PATH/.config" \
@@ -477,16 +533,7 @@ jobs:
           done
           set +f
 
-          required_packages="
-            kmod-airoha-pon-frontend
-            kmod-airoha-en7572
-            kmod-airoha-paged-bosa
-            kmod-airoha-xpon
-            airoha-ponctl
-            airoha-pond
-            luci-app-pon
-          "
-          for package in $required_packages; do
+          for package in $REQUIRED_PACKAGES; do
             grep -q "^CONFIG_PACKAGE_${package}=y$" "$OPENWRT_PATH/.config" \
               || { echo "::error::Required PON package was dropped: $package"; exit 1; }
           done
@@ -502,7 +549,8 @@ jobs:
 
           {
             echo "### Build configuration"
-            echo "- Device: \`nokia_xg-040g-tf-ubi\`"
+            echo "- Model / 型号: \`$MODEL_NAME_ZH / $MODEL_NAME_EN\`"
+            echo "- Target profile: \`$TARGET_CONFIG_SYMBOL\`"
             echo "- PonWrt commit: \`$PONWRT_COMMIT\`"
             echo "- Required PON packages: verified"
             echo "- Package manager: \`apk\`"
@@ -548,11 +596,14 @@ jobs:
       - name: Prepare artifacts
         run: |
           set -euo pipefail
-          out="$OPENWRT_PATH/bin/targets/airoha/an7581"
+          out="$OPENWRT_PATH/bin/targets/$TARGET_SUBDIR"
           test -d "$out"
 
           {
-            echo "device=nokia_xg-040g-tf-ubi"
+            echo "model_id=$MODEL_ID"
+            echo "model_name_en=$MODEL_NAME_EN"
+            echo "model_name_zh=$MODEL_NAME_ZH"
+            echo "target_profile=$TARGET_CONFIG_SYMBOL"
             echo "ponwrt_repo=$PONWRT_REPO"
             echo "ponwrt_ref=$PONWRT_REF"
             echo "ponwrt_commit=$PONWRT_COMMIT"
@@ -573,7 +624,7 @@ jobs:
           } > "$out/build-manifest.txt"
 
           cp "$OPENWRT_PATH/.config" "$out/build.config"
-          cp "$GITHUB_WORKSPACE/configs/xg-040g-tf.config" "$out/base.config"
+          cp "$GITHUB_WORKSPACE/configs/$MODEL_ID.config" "$out/base.config"
 
           package_count=$(find "$OPENWRT_PATH/bin/packages" -type f \
             \( -name '*.apk' -o -name '*.ipk' \) | wc -l | tr -d ' ')
@@ -601,7 +652,8 @@ jobs:
               cp "$OPENWRT_PATH/public-key.pem" "$package_bundle/public-key.pem"
             fi
             {
-              echo "device=nokia_xg-040g-tf-ubi"
+              echo "model_id=$MODEL_ID"
+              echo "target_profile=$TARGET_CONFIG_SYMBOL"
               echo "ponwrt_commit=$PONWRT_COMMIT"
               echo "config_hash=$CONFIG_HASH"
               echo "feed_hash=$FEED_HASH"
@@ -615,12 +667,12 @@ jobs:
               find packages -type f -print0 | sort -z | xargs -0 sha256sum
             ) > "$package_bundle/SHA256SUMS"
 
-            tar -czf "$out/xg-040g-tf-packages.tar.gz" \
+            tar -czf "$out/${ARTIFACT_PREFIX}-packages.tar.gz" \
               -C "$package_bundle" .
             rm -rf "$package_bundle"
 
             {
-              echo "- \`xg-040g-tf-packages.tar.gz\` — all compiled APK/IPK packages"
+              echo "- \`${ARTIFACT_PREFIX}-packages.tar.gz\` — all compiled APK/IPK packages"
               echo "- package count: \`$package_count\`"
               echo "- Install only on the matching PonWrt release"
             } >> "$GITHUB_STEP_SUMMARY"
@@ -678,7 +730,8 @@ jobs:
               cp "$OPENWRT_PATH/public-key.pem" "$bundle/public-key.pem"
             fi
             {
-              echo "device=nokia_xg-040g-tf-ubi"
+              echo "model_id=$MODEL_ID"
+              echo "target_profile=$TARGET_CONFIG_SYMBOL"
               echo "ponwrt_commit=$PONWRT_COMMIT"
               echo "config_hash=$CONFIG_HASH"
               echo "feed_hash=$FEED_HASH"
@@ -686,7 +739,7 @@ jobs:
               echo "kmod_count=$kmod_count"
               echo "package_manager=apk"
               echo
-              echo "Install only on the matching XG-040G-TF PonWrt release."
+              echo "Install only on the matching $MODEL_NAME_EN PonWrt release."
               echo "The bundle is not a generic OpenWrt kmod repository."
               echo "If using apk, install local packages from the packages/ tree."
             } > "$bundle/kmod-manifest.txt"
@@ -698,7 +751,7 @@ jobs:
                 | xargs -0 sha256sum
             ) > "$bundle/SHA256SUMS"
 
-            python3 - "$bundle" "$out/xg-040g-tf-kmods.zip" <<'PY'
+            python3 - "$bundle" "$out/${ARTIFACT_PREFIX}-kmods.zip" <<'PY'
           import os
           import sys
           import zipfile
@@ -711,11 +764,11 @@ jobs:
                       archive.write(path, os.path.relpath(path, root))
           PY
 
-            cp "$bundle/SHA256SUMS" "$out/xg-040g-kmods.SHA256SUMS"
+            cp "$bundle/SHA256SUMS" "$out/${ARTIFACT_PREFIX}-kmods.SHA256SUMS"
             rm -rf "$bundle"
 
             {
-              echo "- \`xg-040g-kmods.zip\` — target-compatible kmod/kernel/firmware packages"
+              echo "- \`${ARTIFACT_PREFIX}-kmods.zip\` — target-compatible kmod/kernel/firmware packages"
               echo "- kmod count: \`$kmod_count\`"
               echo "- Only install packages matching this exact firmware release"
             } >> "$GITHUB_STEP_SUMMARY"
@@ -726,11 +779,11 @@ jobs:
             echo "PonWrt commit: \`$PONWRT_COMMIT\`"
             echo "Feed fingerprint: \`$FEED_HASH\`"
             echo "Compiled package count: \`$package_count\`"
-            echo "The artifact contains the TF UBI image, recovery image (if generated), config, manifest, and xg-040g-tf.SHA256SUMS."
+            echo "The artifact contains the firmware image, recovery image (if generated), config, manifest, and ${ARTIFACT_PREFIX}.SHA256SUMS."
             echo
             echo "**Important:** \`bosa\` and \`ri\` are per-device data and are not included in this build."
             if [ "$INCLUDE_ALL_KMODS" = "true" ]; then
-              echo "**kmod bundle:** \`xg-040g-kmods.zip\` contains only packages built for this exact kernel/configuration."
+              echo "**kmod bundle:** \`${ARTIFACT_PREFIX}-kmods.zip\` contains only packages built for this exact kernel/configuration."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -739,14 +792,14 @@ jobs:
             find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
               | sort -z \
               | xargs -0 sha256sum
-          ) > "$out/xg-040g-tf.SHA256SUMS"
+          ) > "$out/${ARTIFACT_PREFIX}.SHA256SUMS"
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xg-040g-tf-ponwrt-${{ github.run_number }}
+          name: ${{ needs.check-upstream.outputs.artifact_prefix }}-ponwrt-${{ github.run_number }}
           path: |
-            openwrt/bin/targets/airoha/an7581
+            openwrt/bin/targets/${{ needs.check-upstream.outputs.target_subdir }}
             build.log
           if-no-files-found: error
           compression-level: 0
@@ -771,13 +824,13 @@ jobs:
       - name: Download firmware artifact
         uses: actions/download-artifact@v4
         with:
-          name: xg-040g-tf-ponwrt-${{ github.run_number }}
+          name: ${{ needs.check-upstream.outputs.artifact_prefix }}-ponwrt-${{ github.run_number }}
           path: release-assets
 
       - name: Stage release files
         run: |
           set -euo pipefail
-          source_dir="$GITHUB_WORKSPACE/release-assets/openwrt/bin/targets/airoha/an7581"
+          source_dir="$GITHUB_WORKSPACE/release-assets/openwrt/bin/targets/${{ needs.check-upstream.outputs.target_subdir }}"
           release_dir="$GITHUB_WORKSPACE/release-files"
           test -d "$source_dir"
           rm -rf "$release_dir"
@@ -826,11 +879,110 @@ jobs:
               --yes
           done <<< "$asset_names"
 
+      - name: Write bilingual release notes
+        env:
+          MODEL_NAME_EN: ${{ needs.check-upstream.outputs.model_name_en }}
+          MODEL_NAME_ZH: ${{ needs.check-upstream.outputs.model_name_zh }}
+          MODEL_ID: ${{ needs.check-upstream.outputs.model_id }}
+          TARGET_PROFILE: ${{ needs.check-upstream.outputs.target_config_symbol }}
+          PONWRT_REF: ${{ needs.check-upstream.outputs.ponwrt_ref }}
+          SOURCE_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
+          CONFIG_HASH: ${{ needs.check-upstream.outputs.config_hash }}
+          FEED_HASH: ${{ needs.check-upstream.outputs.feed_hash }}
+          FEED_REVISIONS: ${{ needs.check-upstream.outputs.feed_revisions }}
+          RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+          BUILD_COMMIT: ${{ github.sha }}
+          INCLUDE_ALL_KMODS: ${{ needs.check-upstream.outputs.include_all_kmods }}
+          INCLUDE_ALL_PACKAGES: ${{ needs.check-upstream.outputs.include_all_packages }}
+          EXCLUDE_KMODS: ${{ needs.check-upstream.outputs.exclude_kmods }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          # ${MODEL_NAME_ZH} / ${MODEL_NAME_EN} PonWrt
+
+          ## 中文
+
+          适用于 **${MODEL_NAME_ZH}** 的 PonWrt 固件构建。
+
+          ### 构建信息
+
+          - 型号标识：\`${MODEL_ID}\`
+          - OpenWrt 目标配置：\`${TARGET_PROFILE}\`
+          - PonWrt 分支或标签：\`${PONWRT_REF}\`
+          - PonWrt 提交：\`${SOURCE_COMMIT}\`
+          - 配置指纹：\`${CONFIG_HASH}\`
+          - feeds 指纹：\`${FEED_HASH}\`
+          - 构建仓库提交：\`${BUILD_COMMIT}\`
+          - Release 标签：\`${RELEASE_TAG}\`
+          - 全量兼容 kmod：\`${INCLUDE_ALL_KMODS}\`
+          - 全量软件包归档：\`${INCLUDE_ALL_PACKAGES}\`
+          - 排除的 kmod：\`${EXCLUDE_KMODS:-无}\`
+
+          ### feeds 提交
+
+          \`\`\`text
+          ${FEED_REVISIONS}
+          \`\`\`
+
+          ### 发布附件
+
+          Release 中的固件、校验和、构建配置、构建清单以及可选的软件包/kmod 归档均来自同一次构建。
+
+          ### 使用注意
+
+          只安装与本次固件完全匹配的 kmod 和软件包。刷机前务必备份并在刷机后恢复本机的 PON 身份与校准数据（包括 \`bosa\`、\`ri\` 和原厂 \`romfile\`，具体以设备实际分区为准）。本 Release 不包含任何设备私有身份数据。
+
+          ## English
+
+          PonWrt firmware build for **${MODEL_NAME_EN}**.
+
+          ### Build information
+
+          - Model ID: \`${MODEL_ID}\`
+          - OpenWrt target profile: \`${TARGET_PROFILE}\`
+          - PonWrt branch or tag: \`${PONWRT_REF}\`
+          - PonWrt commit: \`${SOURCE_COMMIT}\`
+          - Configuration fingerprint: \`${CONFIG_HASH}\`
+          - Feed fingerprint: \`${FEED_HASH}\`
+          - Build repository commit: \`${BUILD_COMMIT}\`
+          - Release tag: \`${RELEASE_TAG}\`
+          - All compatible kmods: \`${INCLUDE_ALL_KMODS}\`
+          - Full package archive: \`${INCLUDE_ALL_PACKAGES}\`
+          - Excluded kmods: \`${EXCLUDE_KMODS:-none}\`
+
+          ### Feed commits
+
+          \`\`\`text
+          ${FEED_REVISIONS}
+          \`\`\`
+
+          ### Release assets
+
+          Firmware, checksums, build configuration, build manifest, and optional package/kmod archives are all generated by this exact build.
+
+          ### Important
+
+          Install kmods and packages only when they match this exact firmware build. Back up the device before flashing and restore its own PON identity and calibration data afterwards (including \`bosa\`, \`ri\`, and the stock \`romfile\`, according to the actual device partitions). No device-private identity data is included in this release.
+          EOF
+          {
+            echo
+            echo "### 构建清单 / Build manifest"
+            echo
+            echo '```text'
+            cat release-files/build-manifest.txt
+            echo '```'
+            echo
+            echo "### 附件列表 / Asset list"
+            find release-files -maxdepth 1 -type f -printf '%f\n' \
+              | sort \
+              | sed 's/^/- `&`/'
+          } >> release-notes.md
+
       - name: Publish release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ needs.check-upstream.outputs.release_tag }}
-          name: XG-040G-TF PonWrt ${{ needs.check-upstream.outputs.source_commit_short }} (${{ needs.check-upstream.outputs.config_hash }}-${{ needs.check-upstream.outputs.feed_hash }})
+          name: ${{ needs.check-upstream.outputs.model_name_zh }} / ${{ needs.check-upstream.outputs.model_name_en }} PonWrt ${{ needs.check-upstream.outputs.source_commit_short }} (${{ needs.check-upstream.outputs.config_hash }}-${{ needs.check-upstream.outputs.feed_hash }})
           commit: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: release-files/*
@@ -839,21 +991,9 @@ jobs:
           # update can only repair this exact immutable build record.
           allowUpdates: true
           replacesArtifacts: true
+          makeLatest: true
           generateReleaseNotes: true
-          body: |
-            PonWrt firmware for Nokia XG-040G-TF.
-
-            - PonWrt ref: `${{ needs.check-upstream.outputs.ponwrt_ref }}`
-            - PonWrt commit: `${{ needs.check-upstream.outputs.source_commit }}`
-            - Configuration fingerprint: `${{ needs.check-upstream.outputs.config_hash }}`
-            - Feed fingerprint: `${{ needs.check-upstream.outputs.feed_hash }}`
-            - Build commit: `${{ github.sha }}`
-            - Target: `nokia_xg-040g-tf-ubi`
-            - All target-compatible kmods: `${{ needs.check-upstream.outputs.include_all_kmods }}`
-            - Full package archive: `${{ needs.check-upstream.outputs.include_all_packages }}`
-
-            Only use kmods from the matching firmware build. Restore the
-            device's own PON identity data after flashing.
+          bodyFile: release-notes.md
 
   record-success:
     name: Record successful upstream commit
@@ -880,6 +1020,7 @@ jobs:
 
       - name: Save source commit state
         env:
+          MODEL_ID: ${{ needs.check-upstream.outputs.model_id }}
           SOURCE_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
           FEED_HASH: ${{ needs.check-upstream.outputs.feed_hash }}
           CONFIG_HASH: ${{ needs.check-upstream.outputs.config_hash }}
@@ -888,7 +1029,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mkdir -p ci
-          cat > ci/last-built-ponwrt-state.env <<EOF
+          cat > "ci/last-built-ponwrt-state-$MODEL_ID.env" <<EOF
+          model_id=$MODEL_ID
           source_commit=$SOURCE_COMMIT
           feed_hash=$FEED_HASH
           config_hash=$CONFIG_HASH
