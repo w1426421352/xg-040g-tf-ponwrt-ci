@@ -202,6 +202,7 @@ jobs:
           last_config_hash=""
           last_model_id=""
           state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-state-$MODEL_ID.env"
+          legacy_state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-state.env"
           if [ -s "$state_file" ]; then
             while IFS='=' read -r state_key state_value; do
               case "$state_key" in
@@ -211,6 +212,20 @@ jobs:
                 model_id) last_model_id="$state_value" ;;
               esac
             done < "$state_file"
+          elif [ -s "$legacy_state_file" ]; then
+            # Read the pre-multi-model state file during the one-time migration.
+            # Only associate it with this model when its build fingerprint
+            # matches; otherwise another model must not inherit its state.
+            while IFS='=' read -r state_key state_value; do
+              case "$state_key" in
+                source_commit) last_source_commit="$state_value" ;;
+                feed_hash) last_feed_hash="$state_value" ;;
+                config_hash) last_config_hash="$state_value" ;;
+              esac
+            done < "$legacy_state_file"
+            if [ "$last_config_hash" = "$config_hash" ]; then
+              last_model_id="$MODEL_ID"
+            fi
           elif [ -s "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt" ]; then
             last_source_commit="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt")"
           fi
@@ -225,7 +240,9 @@ jobs:
           should_build=false
           case "$EVENT_NAME" in
             push)
-              should_build=true
+              if [ "$state_changed" = "true" ]; then
+                should_build=true
+              fi
               ;;
             workflow_dispatch)
               if [ "$FORCE_BUILD" = "true" ] || [ "$state_changed" = "true" ]; then
