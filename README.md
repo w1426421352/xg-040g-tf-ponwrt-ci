@@ -35,9 +35,9 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
    删除基础包时在包名前加 `-`，例如 `EXTRA_PACKAGES="-luci-app-upnp"`。
    `EXCLUDE_KMODS` 用于从全量 kmod 扩展中排除当前 PonWrt 内核树无法编译的模块；
    它只接受 `kmod-*` 包名，并会写入最终 `.config` 作为显式禁用项。
-2. 推送配置文件到 `main` 会立即触发一次构建。工作流每天北京时间 02:00 检查
-   `PONWRT_REF`、普通插件 feeds 和 PON feeds 的提交指纹，只有发现源码、feed
-   或配置变化才编译；成功构建后会记录三项状态。
+2. 推送配置文件到 `main` 会触发一次检查；只有发现 `PONWRT_REF`、普通插件
+   feeds、PON feeds 或机型配置指纹变化时才编译。工作流每天北京时间 02:00
+   也会执行同样的检查；成功构建后会记录按机型区分的状态。
 3. 手动运行时选择 `model`（配置文件前缀）和 `force_build`；其他构建参数继续由
    对应的 `configs/<model>.build.env` 管理。
 4. 编译完成后，在运行页面底部下载 `<model>-ponwrt-*` Artifact。先核对
