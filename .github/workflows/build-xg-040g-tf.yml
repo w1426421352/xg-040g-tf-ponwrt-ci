@@ -500,6 +500,7 @@ jobs:
           miniupnpd_makefile="$miniupnpd_dir/Makefile"
           miniupnpd_patch="$miniupnpd_dir/patches/020-descr-filter-fix.patch"
           miniupnpd_allow_private_patch="$miniupnpd_dir/patches/030-allow-private-fix.patch"
+          miniupnpd_logging_patch="$miniupnpd_dir/patches/040-improve-logging.patch"
           if [ -f "$miniupnpd_makefile" ] &&
              [ -f "$miniupnpd_patch" ] &&
              grep -q '^PKG_VERSION:=2\.3\.11$' "$miniupnpd_makefile" &&
@@ -517,6 +518,16 @@ jobs:
             mkdir -p "$disabled_patch_dir"
             mv "$miniupnpd_allow_private_patch" "$disabled_patch_dir/030-allow-private-fix.patch"
             echo "::notice::Disabled stale miniupnpd private-address patch for bundled 2.3.11 implementation"
+          fi
+          if [ -f "$miniupnpd_makefile" ] &&
+             [ -f "$miniupnpd_logging_patch" ] &&
+             grep -q '^PKG_VERSION:=2\.3\.11$' "$miniupnpd_makefile" &&
+             grep -q 'Single search found' "$miniupnpd_logging_patch" &&
+             grep -q 'Extra logging by setting log level' "$miniupnpd_logging_patch"; then
+            disabled_patch_dir="$OPENWRT_PATH/.ponwrt-disabled-patches"
+            mkdir -p "$disabled_patch_dir"
+            mv "$miniupnpd_logging_patch" "$disabled_patch_dir/040-improve-logging.patch"
+            echo "::notice::Disabled stale miniupnpd logging patch for bundled 2.3.11 implementation"
           fi
 
       - name: Load APK signing key
