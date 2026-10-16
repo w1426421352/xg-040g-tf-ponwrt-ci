@@ -48,7 +48,9 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
    指纹”创建不可覆盖的 GitHub Release；每次上游提交、feed 或配置发生变化都会
    形成独立归档，旧 Release 不会被替换。成功创建的 Release 会显式标记为
    GitHub `latest`，说明同时提供中文和 English 两部分。设为 `false` 时只保留
-   Actions Artifact。
+   Actions Artifact。若本次 push 同时修改了 `.github/workflows/`，Release 的 Git
+   tag 会指向 push 前的安全提交，以兼容 GitHub 对 `GITHUB_TOKEN` 创建此类
+   Release 的权限限制；实际构建提交仍会记录在清单和 Release 说明中。
 
 工作流不会自动刷写设备，也不会把 PON 身份数据写入产物。
 
