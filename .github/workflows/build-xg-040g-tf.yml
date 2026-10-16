@@ -503,7 +503,9 @@ jobs:
              [ -f "$miniupnpd_patch" ] &&
              grep -q '^PKG_VERSION:=2\.3\.11$' "$miniupnpd_makefile" &&
              grep -q 'Rewrite permission line parser' "$miniupnpd_patch"; then
-            mv "$miniupnpd_patch" "$miniupnpd_patch.disabled"
+            disabled_patch_dir="$OPENWRT_PATH/.ponwrt-disabled-patches"
+            mkdir -p "$disabled_patch_dir"
+            mv "$miniupnpd_patch" "$disabled_patch_dir/020-descr-filter-fix.patch"
             echo "::notice::Disabled stale miniupnpd parser patch for bundled 2.3.11 implementation"
           fi
 
@@ -1108,9 +1110,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        needs.check-upstream.outputs.should_build == 'true' &&
-        needs.build.result == 'success' &&
-        needs.record-success.result == 'success'
+        needs.build.result == 'success'
       }}
     needs:
       - check-upstream
