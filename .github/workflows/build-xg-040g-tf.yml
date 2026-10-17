@@ -367,6 +367,10 @@ jobs:
             echo "::error::retry_release requires a matching successful build state"
             exit 1
           fi
+          if [ "$RETRY_RELEASE" = "true" ] && [ "$PUBLISH_RELEASE" != "true" ]; then
+            echo "::error::retry_release requires PUBLISH_RELEASE=true in the model configuration"
+            exit 1
+          fi
           should_release=false
           if [ "$PUBLISH_RELEASE" = "true" ] &&
              { [ "$should_build" = "true" ] ||
