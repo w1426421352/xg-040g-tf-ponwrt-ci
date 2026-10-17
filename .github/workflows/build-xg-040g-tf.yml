@@ -24,6 +24,11 @@ on:
         required: true
         default: false
         type: boolean
+      retry_release:
+        description: "Retry publishing the already-built artifact without rebuilding"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -41,6 +46,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       should_build: ${{ steps.resolve.outputs.should_build }}
+      should_release: ${{ steps.resolve.outputs.should_release }}
       ponwrt_repo: ${{ steps.resolve.outputs.ponwrt_repo }}
       ponwrt_ref: ${{ steps.resolve.outputs.ponwrt_ref }}
       extra_packages: ${{ steps.resolve.outputs.extra_packages }}
@@ -65,11 +71,15 @@ jobs:
       required_packages: ${{ steps.resolve.outputs.required_packages }}
       release_target_commit: ${{ steps.resolve.outputs.release_target_commit }}
       release_target_reason: ${{ steps.resolve.outputs.release_target_reason }}
+      build_commit: ${{ steps.resolve.outputs.build_commit }}
+      artifact_run_id: ${{ steps.resolve.outputs.artifact_run_id }}
+      artifact_name: ${{ steps.resolve.outputs.artifact_name }}
     env:
       EVENT_NAME: ${{ github.event_name }}
       EVENT_BEFORE: ${{ github.event.before || '' }}
       MODEL_INPUT: ${{ inputs.model || 'xg-040g-tf' }}
       FORCE_BUILD: ${{ inputs.force_build || false }}
+      RETRY_RELEASE: ${{ inputs.retry_release || false }}
 
     steps:
       - name: Check out build configuration
@@ -236,7 +246,17 @@ jobs:
           last_feed_hash=""
           last_config_hash=""
           last_model_id=""
+          build_commit=""
+          artifact_run_id=""
+          artifact_name=""
+          built_release_target_commit=""
+          built_release_target_reason=""
+          released_source_commit=""
+          released_feed_hash=""
+          released_config_hash=""
+          released_release_tag=""
           state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-state-$MODEL_ID.env"
+          release_state_file="$GITHUB_WORKSPACE/ci/last-released-ponwrt-state-$MODEL_ID.env"
           legacy_state_file="$GITHUB_WORKSPACE/ci/last-built-ponwrt-state.env"
           if [ -s "$state_file" ]; then
             while IFS='=' read -r state_key state_value; do
@@ -245,6 +265,11 @@ jobs:
                 feed_hash) last_feed_hash="$state_value" ;;
                 config_hash) last_config_hash="$state_value" ;;
                 model_id) last_model_id="$state_value" ;;
+                build_commit) build_commit="$state_value" ;;
+                artifact_run_id) artifact_run_id="$state_value" ;;
+                artifact_name) artifact_name="$state_value" ;;
+                release_target_commit) built_release_target_commit="$state_value" ;;
+                release_target_reason) built_release_target_reason="$state_value" ;;
               esac
             done < "$state_file"
           elif [ -s "$legacy_state_file" ]; then
@@ -264,6 +289,16 @@ jobs:
           elif [ -s "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt" ]; then
             last_source_commit="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/ci/last-built-ponwrt-commit.txt")"
           fi
+          if [ -s "$release_state_file" ]; then
+            while IFS='=' read -r state_key state_value; do
+              case "$state_key" in
+                source_commit) released_source_commit="$state_value" ;;
+                feed_hash) released_feed_hash="$state_value" ;;
+                config_hash) released_config_hash="$state_value" ;;
+                release_tag) released_release_tag="$state_value" ;;
+              esac
+            done < "$release_state_file"
+          fi
           state_changed=false
           if [ "$MODEL_ID" != "$last_model_id" ] ||
              [ "$source_commit" != "$last_source_commit" ] ||
@@ -272,20 +307,38 @@ jobs:
             state_changed=true
           fi
 
+          release_tag="${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}-${feed_hash}"
+          build_success=false
+          if [ "$state_changed" = "false" ] &&
+             [ -n "$build_commit" ] &&
+             [ -n "$artifact_run_id" ] &&
+             [ -n "$artifact_name" ]; then
+            build_success=true
+          fi
+          release_success=false
+          if [ "$released_source_commit" = "$source_commit" ] &&
+             [ "$released_feed_hash" = "$feed_hash" ] &&
+             [ "$released_config_hash" = "$config_hash" ] &&
+             [ "$released_release_tag" = "$release_tag" ]; then
+            release_success=true
+          fi
+
           should_build=false
           case "$EVENT_NAME" in
             push)
-              if [ "$state_changed" = "true" ]; then
+              if [ "$state_changed" = "true" ] || [ "$build_success" = "false" ]; then
                 should_build=true
               fi
               ;;
             workflow_dispatch)
-              if [ "$FORCE_BUILD" = "true" ] || [ "$state_changed" = "true" ]; then
+              if [ "$FORCE_BUILD" = "true" ] ||
+                 [ "$state_changed" = "true" ] ||
+                 [ "$build_success" = "false" ]; then
                 should_build=true
               fi
               ;;
             schedule)
-              if [ "$state_changed" = "true" ]; then
+              if [ "$state_changed" = "true" ] || [ "$build_success" = "false" ]; then
                 should_build=true
               fi
               ;;
@@ -295,8 +348,33 @@ jobs:
               ;;
           esac
 
+          if [ "$RETRY_RELEASE" = "true" ] && [ "$build_success" = "false" ]; then
+            echo "::error::retry_release requires a matching successful build state"
+            exit 1
+          fi
+          should_release=false
+          if [ "$PUBLISH_RELEASE" = "true" ] &&
+             { [ "$should_build" = "true" ] ||
+               { [ "$build_success" = "true" ] && [ "$release_success" = "false" ]; }; }; then
+            should_release=true
+          fi
+          if [ "$RETRY_RELEASE" = "true" ]; then
+            should_release=true
+          fi
+          if [ "$should_build" = "true" ]; then
+            build_commit="$GITHUB_SHA"
+            artifact_run_id="$GITHUB_RUN_ID"
+            artifact_name="${ARTIFACT_PREFIX}-ponwrt-${GITHUB_RUN_NUMBER}"
+            built_release_target_commit="$release_target_commit"
+            built_release_target_reason="$release_target_reason"
+          elif [ "$build_success" = "true" ]; then
+            release_target_commit="$built_release_target_commit"
+            release_target_reason="$built_release_target_reason"
+          fi
+
           {
             echo "should_build=$should_build"
+            echo "should_release=$should_release"
             echo "model_id=$MODEL_ID"
             echo "model_name_en=$MODEL_NAME_EN"
             echo "model_name_zh=$MODEL_NAME_ZH"
@@ -319,7 +397,12 @@ jobs:
             echo "feed_hash=$feed_hash"
             echo "include_all_packages=$INCLUDE_ALL_PACKAGES"
             echo "use_ccache=$USE_CCACHE"
-            echo "release_tag=${RELEASE_PREFIX}-${source_commit:0:12}-${config_hash}-${feed_hash}"
+            echo "release_tag=$release_tag"
+            echo "build_commit=$build_commit"
+            echo "artifact_run_id=$artifact_run_id"
+            echo "artifact_name=$artifact_name"
+            echo "build_success=$build_success"
+            echo "release_success=$release_success"
             echo "feed_revisions<<EOF"
             printf '%s' "$feed_revisions"
             echo
@@ -337,6 +420,10 @@ jobs:
             echo "- Previously built feed hash: \`${last_feed_hash:-none}\`"
             echo "- Previous configuration fingerprint: \`${last_config_hash:-none}\`"
             echo "- Build required: \`$should_build\`"
+            echo "- Build state recorded: \`$build_success\`"
+            echo "- Release required: \`$should_release\`"
+            echo "- Release state recorded: \`$release_success\`"
+            echo "- Release retry requested: \`$RETRY_RELEASE\`"
             echo "- Release target commit: \`$release_target_commit\` ($release_target_reason)"
             echo "- Configuration fingerprint: \`$config_hash\`"
             echo "- Feed fingerprint: \`$feed_hash\`"
@@ -901,8 +988,9 @@ jobs:
     name: Publish GitHub Release
     if: >-
       ${{
-        needs.check-upstream.outputs.should_build == 'true' &&
-        needs.check-upstream.outputs.publish_release == 'true'
+        always() &&
+        needs.check-upstream.outputs.should_release == 'true' &&
+        (needs.build.result == 'success' || needs.build.result == 'skipped')
       }}
     needs:
       - check-upstream
@@ -916,8 +1004,11 @@ jobs:
       - name: Download firmware artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.check-upstream.outputs.artifact_prefix }}-ponwrt-${{ github.run_number }}
+          name: ${{ needs.check-upstream.outputs.artifact_name }}
           path: release-assets
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.check-upstream.outputs.artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Stage release files
         run: |
@@ -983,7 +1074,8 @@ jobs:
           FEED_HASH: ${{ needs.check-upstream.outputs.feed_hash }}
           FEED_REVISIONS: ${{ needs.check-upstream.outputs.feed_revisions }}
           RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
-          BUILD_COMMIT: ${{ github.sha }}
+          BUILD_COMMIT: ${{ needs.check-upstream.outputs.build_commit }}
+          BUILD_RUN_ID: ${{ needs.check-upstream.outputs.artifact_run_id }}
           INCLUDE_ALL_KMODS: ${{ needs.check-upstream.outputs.include_all_kmods }}
           INCLUDE_ALL_PACKAGES: ${{ needs.check-upstream.outputs.include_all_packages }}
           EXCLUDE_KMODS: ${{ needs.check-upstream.outputs.exclude_kmods }}
@@ -1007,6 +1099,7 @@ jobs:
           - 配置指纹：\`${CONFIG_HASH}\`
           - feeds 指纹：\`${FEED_HASH}\`
           - 构建仓库提交：\`${BUILD_COMMIT}\`
+          - 构建运行：\`${BUILD_RUN_ID}\`
           - Release tag 目标提交：\`${RELEASE_TARGET_COMMIT}\`（${RELEASE_TARGET_REASON}）
           - Release 标签：\`${RELEASE_TAG}\`
           - 全量兼容 kmod：\`${INCLUDE_ALL_KMODS}\`
@@ -1040,6 +1133,7 @@ jobs:
           - Configuration fingerprint: \`${CONFIG_HASH}\`
           - Feed fingerprint: \`${FEED_HASH}\`
           - Build repository commit: \`${BUILD_COMMIT}\`
+          - Build run: \`${BUILD_RUN_ID}\`
           - Release tag target commit: \`${RELEASE_TARGET_COMMIT}\` (${RELEASE_TARGET_REASON})
           - Release tag: \`${RELEASE_TAG}\`
           - All compatible kmods: \`${INCLUDE_ALL_KMODS}\`
@@ -1091,19 +1185,17 @@ jobs:
           generateReleaseNotes: true
           bodyFile: release-notes.md
 
-  record-success:
-    name: Record successful upstream commit
+  record-build-success:
+    name: Record successful firmware build
     if: >-
       ${{
         always() &&
         needs.check-upstream.outputs.should_build == 'true' &&
-        needs.build.result == 'success' &&
-        (needs.release.result == 'success' || needs.release.result == 'skipped')
+        needs.build.result == 'success'
       }}
     needs:
       - check-upstream
       - build
-      - release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -1120,6 +1212,12 @@ jobs:
           SOURCE_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
           FEED_HASH: ${{ needs.check-upstream.outputs.feed_hash }}
           CONFIG_HASH: ${{ needs.check-upstream.outputs.config_hash }}
+          BUILD_COMMIT: ${{ needs.check-upstream.outputs.build_commit }}
+          ARTIFACT_RUN_ID: ${{ needs.check-upstream.outputs.artifact_run_id }}
+          ARTIFACT_NAME: ${{ needs.check-upstream.outputs.artifact_name }}
+          RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+          RELEASE_TARGET_COMMIT: ${{ needs.check-upstream.outputs.release_target_commit }}
+          RELEASE_TARGET_REASON: ${{ needs.check-upstream.outputs.release_target_reason }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -1130,6 +1228,12 @@ jobs:
           source_commit=$SOURCE_COMMIT
           feed_hash=$FEED_HASH
           config_hash=$CONFIG_HASH
+          build_commit=$BUILD_COMMIT
+          artifact_run_id=$ARTIFACT_RUN_ID
+          artifact_name=$ARTIFACT_NAME
+          release_tag=$RELEASE_TAG
+          release_target_commit=$RELEASE_TARGET_COMMIT
+          release_target_reason=$RELEASE_TARGET_REASON
           EOF
           rm -f ci/last-built-ponwrt-commit.txt
           git add -A ci
@@ -1138,6 +1242,57 @@ jobs:
             exit 0
           fi
           git commit -m "ci: record successful PonWrt build $SOURCE_COMMIT"
+          git push origin HEAD:main
+
+  record-release-success:
+    name: Record successful GitHub Release
+    if: >-
+      ${{
+        always() &&
+        needs.check-upstream.outputs.should_release == 'true' &&
+        needs.release.result == 'success'
+      }}
+    needs:
+      - check-upstream
+      - release
+      - record-build-success
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Save release state
+        env:
+          MODEL_ID: ${{ needs.check-upstream.outputs.model_id }}
+          SOURCE_COMMIT: ${{ needs.check-upstream.outputs.source_commit }}
+          FEED_HASH: ${{ needs.check-upstream.outputs.feed_hash }}
+          CONFIG_HASH: ${{ needs.check-upstream.outputs.config_hash }}
+          RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p ci
+          cat > "ci/last-released-ponwrt-state-$MODEL_ID.env" <<EOF
+          model_id=$MODEL_ID
+          source_commit=$SOURCE_COMMIT
+          feed_hash=$FEED_HASH
+          config_hash=$CONFIG_HASH
+          release_tag=$RELEASE_TAG
+          release_run_id=$RELEASE_RUN_ID
+          EOF
+          git add -A ci
+          if git diff --cached --quiet; then
+            echo "Release state is already recorded"
+            exit 0
+          fi
+          git commit -m "ci: record successful PonWrt release $RELEASE_TAG"
           git push origin HEAD:main
 
   cleanup-cache:
@@ -1151,7 +1306,8 @@ jobs:
       - check-upstream
       - build
       - release
-      - record-success
+      - record-build-success
+      - record-release-success
     runs-on: ubuntu-24.04
     permissions:
       actions: write
