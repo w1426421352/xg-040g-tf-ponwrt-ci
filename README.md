@@ -38,8 +38,10 @@ AN7581 的 PON 驱动、用户态控制工具和 LuCI PON 页面。工作流不�
 2. 推送配置文件到 `main` 会触发一次检查；只有发现 `PONWRT_REF`、普通插件
    feeds、PON feeds 或机型配置指纹变化时才编译。工作流每天北京时间 02:00
    也会执行同样的检查；成功构建后会记录按机型区分的状态。
-3. 手动运行时选择 `model`（配置文件前缀）和 `force_build`；其他构建参数继续由
-   对应的 `configs/<model>.build.env` 管理。
+3. 手动运行时选择 `model`（配置文件前缀）、`force_build` 和 `retry_release`；其他构建
+   参数继续由对应的 `configs/<model>.build.env` 管理。`retry_release=true` 只重试发布
+   已记录的构建 Artifact，不会重新编译；如果 Artifact 已过期或不存在，工作流会明确报错，
+   此时应关闭 `retry_release` 重新构建。
 4. 编译完成后，在运行页面底部下载 `<model>-ponwrt-*` Artifact。先核对
    `SHA256SUMS`，再使用其中的固件文件。
 5. 手动运行工作流时，在 `model` 输入中填写配置文件前缀，例如 `xg-040g-tf`；
@@ -82,9 +84,12 @@ kernel/firmware 伴随包、`.config`、清单和校验文件。
 如需稳定的 APK 包签名，可在 GitHub Secrets 中设置 `PONWRT_APK_PRIVATE_KEY`。
 未设置时使用构建系统默认密钥。
 
-工作流会在成功后由 `github-actions[bot]` 向 `main` 写入按机型区分的
-`ci/last-built-ponwrt-state-<model>.env`；如果仓库分支保护禁止该机器人推送，状态记录会失败，
-后续每日检查可能重复编译，需要为 Actions 允许这一次状态提交。
+工作流把“已成功编译”和“已成功发布”分开记录。成功编译后由 `github-actions[bot]` 向
+`main` 写入按机型区分的 `ci/last-built-ponwrt-state-<model>.env`，其中包含构建运行 ID
+和 Artifact 名称；Release 成功后再写入 `ci/last-released-ponwrt-state-<model>.env`。
+如果 Release 临时失败，后续 push、定时运行或 `retry_release=true` 会复用该 Artifact，
+只执行 Release job，不重复编译。Artifact 默认保留 30 天；如果仓库分支保护禁止机器人
+推送状态提交，状态记录会失败，需为 Actions 允许这两类状态提交。
 
 ## 上游插件兼容性
 
@@ -107,9 +112,9 @@ PonWrt 的 AN7581 默认配置还会关闭 `luci-app-iptv`，因此本仓库也�
 时再把 `luci-app-iptv` 放进 `EXTRA_PACKAGES`，让 CI 验证它在当前 feed 组合下能否编译。
 
 工作流会在 `make defconfig` 后验证附加包仍然存在，把所有 feed 的 commit、PonWrt
-提交和配置指纹写入 `build-manifest.txt`，并在成功后更新
-`ci/last-built-ponwrt-state.env`。
-这能避免上游插件改名、依赖不满足或被 Kconfig 静默移除后仍产出错误固件。
+提交和配置指纹写入 `build-manifest.txt`，并在成功后更新按机型区分的构建状态。
+这能避免上游插件改名、依赖不满足或被 Kconfig 静默移除后仍产出错误固件；构建状态和
+发布状态分别记录也能避免 Release 失败后重复编译同一份固件。
 
 ## PON 数据必须先备份
 

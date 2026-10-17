@@ -44,6 +44,9 @@ jobs:
   check-upstream:
     name: Check PonWrt upstream
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       should_build: ${{ steps.resolve.outputs.should_build }}
       should_release: ${{ steps.resolve.outputs.should_release }}
@@ -80,6 +83,7 @@ jobs:
       MODEL_INPUT: ${{ inputs.model || 'xg-040g-tf' }}
       FORCE_BUILD: ${{ inputs.force_build || false }}
       RETRY_RELEASE: ${{ inputs.retry_release || false }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Check out build configuration
@@ -313,7 +317,17 @@ jobs:
              [ -n "$build_commit" ] &&
              [ -n "$artifact_run_id" ] &&
              [ -n "$artifact_name" ]; then
-            build_success=true
+            artifact_available="$(
+              gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run_id/artifacts" \
+                --paginate \
+                --jq "[.artifacts[] | select(.name == \"$artifact_name\" and .expired == false)] | length"
+            )"
+            if [ "$artifact_available" -gt 0 ]; then
+              build_success=true
+            else
+              echo "::warning::Recorded build artifact is missing or expired: $artifact_name (run $artifact_run_id)"
+            fi
           fi
           release_success=false
           if [ "$released_source_commit" = "$source_commit" ] &&
@@ -1039,28 +1053,41 @@ jobs:
           find "$release_dir" -maxdepth 1 -type f -print
           test -n "$(find "$release_dir" -maxdepth 1 -type f -print -quit)"
 
-      - name: Remove stale release assets
+      - name: Verify existing release
+        id: verify_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+          BUILD_WAS_SKIPPED: ${{ needs.build.result == 'skipped' }}
         run: |
           set -euo pipefail
-          asset_names="$(gh release view "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json assets \
-            --jq '.assets[].name' 2>/dev/null || true)"
-          if [ -z "$asset_names" ]; then
-            echo "No existing assets for $RELEASE_TAG"
+          if [ "$BUILD_WAS_SKIPPED" != "true" ]; then
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+            echo "A new firmware build was produced; publish its artifacts."
             exit 0
           fi
-
-          while IFS= read -r asset_name; do
-            [ -n "$asset_name" ] || continue
-            echo "Removing stale release asset: $asset_name"
-            gh release delete-asset "$RELEASE_TAG" "$asset_name" \
-              --repo "$GITHUB_REPOSITORY" \
-              --yes
-          done <<< "$asset_names"
+          existing_assets="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq 'select(.isDraft == false and .isPrerelease == false) | .assets[].name' \
+            2>/dev/null || true)"
+          complete=true
+          if [ -z "$existing_assets" ]; then
+            complete=false
+          else
+            while IFS= read -r release_file; do
+              [ -n "$release_file" ] || continue
+              asset_name="$(basename "$release_file")"
+              if ! printf '%s\n' "$existing_assets" | grep -Fqx "$asset_name"; then
+                echo "Existing release is missing asset: $asset_name"
+                complete=false
+              fi
+            done < <(find release-files -maxdepth 1 -type f -print)
+          fi
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+          if [ "$complete" = "true" ]; then
+            echo "Release $RELEASE_TAG already has all expected assets; publish is idempotently complete."
+          fi
 
       - name: Write bilingual release notes
         env:
@@ -1169,6 +1196,7 @@ jobs:
           } >> release-notes.md
 
       - name: Publish release
+        if: steps.verify_release.outputs.complete != 'true'
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ needs.check-upstream.outputs.release_tag }}
