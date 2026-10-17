@@ -12,6 +12,7 @@ on:
     paths:
       - ".github/workflows/build-xg-040g-tf.yml"
       - "configs/**"
+      - "ci/**"
   workflow_dispatch:
     inputs:
       model:
